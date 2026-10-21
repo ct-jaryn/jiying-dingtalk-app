@@ -2,6 +2,7 @@
   "name": "jiying-dingtalk-app",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "即应里的个人钉钉聊天助手：推送相关消息，并在应用单聊里调用 dws",
   "engines": {
