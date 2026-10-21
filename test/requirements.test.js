@@ -4,13 +4,15 @@ import { classify, conversationTitle, formatMainPush, formatTopicPush, isAtAll, 
 import { splitProtectedAndRounds, toAnthropicMessages, truncateOldToolResults, visibleHistory } from "../src/session.js";
 import { attachmentFromBody, extractMediaIds, imageResourceIds, textWithoutImages } from "../src/media.js";
 import { creationText, findByTopicId, idsFromSend, rememberTopic, topicFor, topicIdFromCreate } from "../src/topics.js";
+import { findEmotionId, sentMessageRef } from "../src/stamp.js";
 import { toolKey } from "../src/tools.js";
 
-test("只推送私聊、@我和@所有人", () => {
+test("默认推送所有群消息，关闭后只保留提及", () => {
   assert.equal(classify({ type: "user_im_message_receive_o2o_all" }), "dm");
   assert.equal(classify({ type: "user_im_message_receive_at" }), "mention");
-  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "普通消息" }), null);
-  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "@所有人 发布" }), "at-all");
+  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "普通消息" }), "group");
+  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "普通消息" }, { allGroupMessages: false }), null);
+  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "@所有人 发布" }, { allGroupMessages: false }), "at-all");
   assert.equal(isAtAll({ content: "请看 @all" }), true);
 });
 
@@ -88,6 +90,13 @@ test("每次只带最近 6 句可见历史和当前指令", () => {
   const messages = toAnthropicMessages(window, "现在处理");
   assert.equal(messages.at(-1).content, "现在处理");
   assert.equal(messages[0].role, "user");
+});
+
+test("发送回执能取出消息和会话 ID", () => {
+  const ref = sentMessageRef({ messageId: "msgABC==", openConversationId: "cidXYZ==" }, "cid-fallback");
+  assert.equal(ref.messageId, "msgABC==");
+  assert.equal(ref.conversationId, "cidXYZ==");
+  assert.equal(findEmotionId({ result: { emotionId: "emo-1" } }), "emo-1");
 });
 
 test("相同工具和参数只算一次", () => {

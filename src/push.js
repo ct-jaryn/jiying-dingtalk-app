@@ -1,10 +1,13 @@
 const REASONS = { dm: "私聊", mention: "@我", "at-all": "@所有人" };
 
-export function classify(event) {
+export function classify(event, { allGroupMessages = true } = {}) {
   const type = String(event?.type || "");
   if (type === "user_im_message_receive_o2o_all") return "dm";
   if (type === "user_im_message_receive_at") return isAtAll(event) ? "at-all" : "mention";
-  if (type === "user_im_message_receive_group_all" && isAtAll(event)) return "at-all";
+  if (type === "user_im_message_receive_group_all") {
+    if (isAtAll(event)) return "at-all";
+    if (allGroupMessages) return "group";
+  }
   return null;
 }
 

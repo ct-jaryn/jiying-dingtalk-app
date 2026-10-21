@@ -8,6 +8,7 @@ import { MagicChat, startStatus } from "./magicchat.js";
 import { attachmentFromBody, downloadImageUrl, extractMediaIds, imageResourceIds, isImageContent, textWithoutImages, urlsFromReadUrls } from "./media.js";
 import { classify, conversationTitle, formatTopicPush, messageBody, mutedForConversation, pushIndexLine } from "./push.js";
 import { appendVisible, rememberPush } from "./session.js";
+import { stampSentMessage } from "./stamp.js";
 import { loadJson, saveJson } from "./store.js";
 import { creationText, emptyTopics, findByTopicId, idsFromSend, rememberTopic, topicFor, topicIdFromCreate } from "./topics.js";
 
@@ -16,6 +17,7 @@ const sessionPath = resolve(root, "data/session.json");
 const pushPath = resolve(root, "data/pushes.json");
 const seenPath = resolve(root, "data/seen.json");
 const topicsPath = resolve(root, "data/topics.json");
+const emotionPath = resolve(root, "data/emotion.json");
 
 let config;
 let chat;
@@ -130,7 +132,7 @@ async function handleUserMessage(payload) {
 }
 
 async function handleDingTalk(event) {
-  const reason = classify(event);
+  const reason = classify(event, { allGroupMessages: config.push.all_group_messages !== false });
   if (!reason) return;
   const id = event.message_id || event.event_id;
   if (!id || seen[id]) return;
@@ -344,12 +346,18 @@ function extensionFrom(contentType, url) {
 }
 
 async function sendDingTalk(record, contentArgs, idempotencyKey) {
-  await runDws([
+  const sent = await runDws([
     "chat", "+messages-send", "--as", "user",
+    "--ai-tag=false",
     ...relayTargetArgs(record),
     ...contentArgs,
+    "--wait-delivery",
     "--idempotency-key", String(idempotencyKey).replace(/[^A-Za-z0-9]/g, "").slice(0, 32) || "relay",
   ], { timeoutMs: 60_000 });
+  await stampSentMessage(sent.data, {
+    conversationId: record.dingTalkConversationId,
+    emotionPath,
+  }).catch((error) => console.error("贴使用即应发送失败：", error.message));
 }
 
 function relayTargetArgs(record) {

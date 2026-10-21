@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { runDws } from "./dws.js";
+import { stampSentMessage } from "./stamp.js";
+import { resolve } from "node:path";
 
 export const TOOLS = [
   {
@@ -96,12 +98,21 @@ export async function executeTool(name, input) {
         ? runDws(["chat", "+chat-search", "--query", input.query])
         : runDws(["contact", "user", "search", "--query", input.query]);
     case "send_message":
-      return runDws(["chat", "+messages-send", "--as", "user", ...sendArgs(input), "--idempotency-key", toolKey(name, input).slice(0, 32)]);
+      return sendAndStamp(["chat", "+messages-send", "--as", "user", "--ai-tag=false", "--wait-delivery", ...sendArgs(input), "--idempotency-key", toolKey(name, input).slice(0, 32)], input.conversation_id);
     case "reply_message":
-      return runDws(["chat", "+messages-reply", "--as", "user", "--message-id", input.message_id, "--content", input.text, ...(input.conversation_id ? ["--group", input.conversation_id] : []), "--idempotency-key", toolKey(name, input).slice(0, 32)]);
+      return sendAndStamp(["chat", "+messages-reply", "--as", "user", "--ai-tag=false", "--message-id", input.message_id, "--content", input.text, ...(input.conversation_id ? ["--group", input.conversation_id] : []), "--idempotency-key", toolKey(name, input).slice(0, 32)], input.conversation_id);
     default:
       throw new Error(`未知工具 ${name}`);
   }
+}
+
+async function sendAndStamp(args, conversationId) {
+  const sent = await runDws(args, { timeoutMs: 60_000 });
+  await stampSentMessage(sent.data, {
+    conversationId,
+    emotionPath: resolve("data/emotion.json"),
+  }).catch((error) => console.error("贴使用即应发送失败：", error.message));
+  return sent;
 }
 
 function searchArgs(input) {
