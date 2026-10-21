@@ -16,3 +16,5 @@ agent:
 push:
   # true：推送所有未免打扰群的消息。false：只推送私聊、@你、@所有人。
   all_group_messages: true
+  # true：免打扰会话也推送。false：免打扰群不推送。
+  muted_conversations: false

@@ -41,7 +41,7 @@ test("主对话和话题使用不同推送格式", () => {
   assert.equal(formatMainPush(dm, "dm", "赵然"), "> 收到来自 **赵然** 的消息\n\n在吗");
   assert.equal(formatMainPush(group, "mention", "销售群"), "> 收到来自 **陈佳** 在 **销售群** 的消息\n\n今晚发布");
   assert.equal(formatTopicPush(dm, "dm"), "在吗");
-  assert.equal(formatTopicPush(group, "at-all"), "> **陈佳**：\n\n今晚发布");
+  assert.equal(formatTopicPush(group, "at-all"), "**陈佳**：今晚发布");
 });
 
 test("话题图片消息能取出文件 ID", () => {

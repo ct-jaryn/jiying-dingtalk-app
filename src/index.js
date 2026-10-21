@@ -6,7 +6,7 @@ import { loadConfig } from "./config.js";
 import { runDws, startEventStream } from "./dws.js";
 import { MagicChat, startStatus } from "./magicchat.js";
 import { attachmentFromBody, downloadImageUrl, extractMediaIds, imageResourceIds, isImageContent, textWithoutImages, urlsFromReadUrls } from "./media.js";
-import { classify, conversationTitle, formatTopicPush, messageBody, mutedForConversation, pushIndexLine } from "./push.js";
+import { classify, conversationTitle, formatTopicPush, formatTopicSender, messageBody, mutedForConversation, pushIndexLine } from "./push.js";
 import { appendVisible, rememberPush } from "./session.js";
 import { stampSentMessage } from "./stamp.js";
 import { loadJson, saveJson } from "./store.js";
@@ -136,15 +136,15 @@ async function handleDingTalk(event) {
   if (!reason) return;
   const id = event.message_id || event.event_id;
   if (!id || seen[id]) return;
-  if (reason !== "dm" && await isMuted(event.conversation_id)) return;
+  if (config.push.muted_conversations !== true && reason !== "dm" && await isMuted(event.conversation_id)) return;
   seen[id] = Date.now();
   await saveJson(seenPath, seen);
   const name = await dingTalkTitle(event, reason);
   const images = await imageUrls(event);
   if (images.length) {
     const extra = textWithoutImages(messageBody(event));
-    const topicCaption = reason === "dm" ? "" : `> **${cleanName(event.sender) || "未知发送人"}**：`;
-    if (extra) await deliverToTopic(event, reason, name, reason === "dm" ? extra : `${topicCaption}\n\n${extra}`);
+    const topicCaption = reason === "dm" ? "" : formatTopicSender(event);
+    if (extra) await deliverToTopic(event, reason, name, reason === "dm" ? extra : `${topicCaption}${extra}`);
     for (const url of images) await deliverImageToTopic(event, reason, name, url, extra ? "" : topicCaption);
   } else {
     await deliverToTopic(event, reason, name, formatTopicPush(event, reason));
