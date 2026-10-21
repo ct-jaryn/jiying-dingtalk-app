@@ -1,6 +1,6 @@
 import { runDws } from "./dws.js";
 import { downloadImageUrl, extractMediaIds, imageResourceIds, isImageContent, textWithoutImages } from "./media.js";
-import { formatTopicPush, messageBody, splitText } from "./push.js";
+import { formatTopicPush, formatTopicSender, messageBody, splitText } from "./push.js";
 import { creationText, idsFromSend, topicFor, topicIdFromCreate } from "./topics.js";
 
 /** Route durable notification parts into one topic per DingTalk conversation. */
@@ -88,8 +88,8 @@ export function createNotificationDelivery({ chat, userId, topics, saveTopics, r
     if (!ids.length) ids = extractMediaIds(body);
     if (!ids.length) throw new Error("图片消息缺少可用的资源 ID，将重试读取");
     const text = textWithoutImages(body);
-    const caption = reason === "dm" ? "" : `> **${event.sender || "未知发送人"}**：`;
-    const parts = text ? splitText(reason === "dm" ? text : `${caption}\n\n${text}`) : [];
+    const caption = reason === "dm" ? "" : formatTopicSender(event);
+    const parts = text ? splitText(`${caption}${text}`) : [];
     // Persist the resource reference, since a downloaded URL can expire while
     // offline. Each send attempt obtains a fresh URL and records its progress.
     for (const mediaId of ids) parts.push({ type: "image", mediaId, caption: text ? "" : caption });

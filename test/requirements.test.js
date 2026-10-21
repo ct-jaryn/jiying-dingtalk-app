@@ -5,6 +5,7 @@ import { splitProtectedAndRounds, toAnthropicMessages, truncateOldToolResults, v
 import { attachmentFromBody, extractMediaIds, imageResourceIds, textWithoutImages } from "../src/media.js";
 import { creationText, findByTopicId, idsFromSend, rememberTopic, topicFor, topicIdFromCreate } from "../src/topics.js";
 import { findEmotionId, sentMessageRef } from "../src/stamp.js";
+import { isRetryable } from "../src/dws.js";
 import { toolKey } from "../src/tools.js";
 
 test("默认推送所有群消息，关闭后只保留提及", () => {
@@ -41,7 +42,7 @@ test("主对话和话题使用不同推送格式", () => {
   assert.equal(formatMainPush(dm, "dm", "赵然"), "> 收到来自 **赵然** 的消息\n\n在吗");
   assert.equal(formatMainPush(group, "mention", "销售群"), "> 收到来自 **陈佳** 在 **销售群** 的消息\n\n今晚发布");
   assert.equal(formatTopicPush(dm, "dm"), "在吗");
-  assert.equal(formatTopicPush(group, "at-all"), "> **陈佳**：\n\n今晚发布");
+  assert.equal(formatTopicPush(group, "at-all"), "**陈佳**：今晚发布");
 });
 
 test("话题图片消息能取出文件 ID", () => {
@@ -97,6 +98,11 @@ test("发送回执能取出消息和会话 ID", () => {
   assert.equal(ref.messageId, "msgABC==");
   assert.equal(ref.conversationId, "cidXYZ==");
   assert.equal(findEmotionId({ result: { emotionId: "emo-1" } }), "emo-1");
+});
+
+test("证书和网络错误会重试，明确不可重试的不重试", () => {
+  assert.equal(isRetryable("tls: failed to verify certificate: x509: certificate signed by unknown authority"), true);
+  assert.equal(isRetryable('{"retryable": false, "message": "参数错误"}'), false);
 });
 
 test("相同工具和参数只算一次", () => {

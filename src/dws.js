@@ -1,6 +1,87 @@
 import { spawn } from "node:child_process";
 
-export function runDws(args, { timeoutMs = 45_000, bin = "dws" } = {}) {
+const RETRIES = 5;
+
+export async function runDws(args, { timeoutMs = 45_000, retries = RETRIES, retryDelayMs = 1000, ...options } = {}) {
+  // All attempts and backoff share the caller's original time budget.
+  const deadline = performance.now() + timeoutMs;
+  const retryLimit = Math.max(0, Math.min(RETRIES, Math.trunc(retries) || 0));
+  const safeToRetry = retrySafeCommand(args);
+  let lastError;
+  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+    if (lastError && performance.now() >= deadline) throw lastError;
+    try {
+      return await runDwsOnce(args, { ...options, timeoutMs: Math.max(1, deadline - performance.now()) });
+    } catch (error) {
+      lastError = error;
+      if (attempt === retryLimit || !safeToRetry || !isRetryable(error)) throw error;
+      const delay = Math.max(0, retryDelayMs) * 2 ** attempt;
+      if (delay >= deadline - performance.now()) throw error;
+      console.error(`dws 失败，${delay / 1000}s 后重试 ${attempt + 1}/${retryLimit}：${error.message}`);
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
+
+export function isRetryable(value) {
+  const text = errorText(value);
+  if (/"retryable"\s*:\s*false/.test(text)) return false;
+  return /retryable"\s*:\s*true|certificate|unknown authority|tls:|request_failed|timeout|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket/i.test(text);
+}
+
+function errorText(value) {
+  const parts = [];
+  const seen = new Set();
+  const visit = (item) => {
+    if (!item || typeof item !== "object") {
+      parts.push(String(item || ""));
+      return;
+    }
+    if (seen.has(item)) return;
+    seen.add(item);
+    if (typeof item.retryable === "boolean") parts.push(`"retryable":${item.retryable}`);
+    // Error.message and cause are non-enumerable; data.error carries CLI flags.
+    if (item instanceof Error) {
+      visit(item.message);
+      visit(item.cause);
+    }
+    for (const [key, child] of Object.entries(item)) {
+      if (key !== "retryable") visit(child);
+    }
+  };
+  visit(value);
+  return parts.join(" ");
+}
+
+function retrySafeCommand(args) {
+  const [domain, action, resource, method] = args;
+  if (domain === "chat") {
+    if (["+at-me", "+search-msg", "+chat-messages", "+chat-search", "+conversation-info", "+messages-mget"].includes(action)) return true;
+    if (action === "message" && ["list-unread-conversations", "download-media"].includes(resource)) return true;
+    if (action === "group" && resource === "user-settings" && method === "query") return true;
+    if (["+messages-send", "+messages-reply"].includes(action)) {
+      let key;
+      for (let index = 2; index < args.length; index += 1) {
+        const arg = args[index];
+        if (arg === "--") break;
+        if (arg === "--idempotency-key") key = args[++index];
+        else if (arg.startsWith("--idempotency-key=")) key = arg.slice("--idempotency-key=".length);
+        // Skip option values: text resembling a flag is still message content.
+        else if (arg.startsWith("--") && !arg.includes("=") && arg !== "--wait-delivery") index += 1;
+      }
+      return typeof key === "string" && Boolean(key.trim()) && !key.startsWith("-");
+    }
+  }
+  // Unknown commands may mutate state; never replay them implicitly.
+  return domain === "contact" && action === "user" && resource === "search";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runDwsOnce(args, { timeoutMs = 45_000, bin = "dws" } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, [...args, "-f", "json", "-y", "--timeout", "30"], {
       stdio: ["ignore", "pipe", "pipe"],

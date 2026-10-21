@@ -38,7 +38,7 @@ async function unusedPort() {
 
 async function fixture(t, {
   events = [], mentions = [], port = 0, initiallyOffline = false, failOnce = "", push,
-  echoDuringRelay = false, failStamp = false,
+  echoDuringRelay = false, failStamp = false, failConfirmation = false, sendFails = false, relayDelayMs = 0,
   groupSettings = { "fixture-muted-group": 1, "fixture-open-group": 0 },
 }) {
   const directory = await mkdtemp(join(tmpdir(), "jiying-realtime-test-"));
@@ -84,7 +84,7 @@ async function fixture(t, {
   await writeFile(join(directory, "injected-events.jsonl"), "");
   await writeFile(join(directory, "mentions.json"), JSON.stringify(mentions));
   await writeFile(join(directory, "group-settings.json"), JSON.stringify(groupSettings));
-  await writeFile(join(directory, "relay-behavior.json"), JSON.stringify({ echoDuringRelay, failStamp }));
+  await writeFile(join(directory, "relay-behavior.json"), JSON.stringify({ echoDuringRelay, failStamp, sendFails, relayDelayMs }));
   const fakeDws = join(directory, "bin", "dws");
   await writeFile(fakeDws, `#!${process.execPath}
 import { appendFileSync, readFileSync, watchFile, writeFileSync } from "node:fs";
@@ -119,6 +119,11 @@ if (args[0] === "event" && args[1] === "consume") {
   process.stdout.write(JSON.stringify({ downloadUrl: "https://fixture.invalid/image.png" }));
 } else if (args[0] === "chat" && args[1] === "+messages-send") {
   const behavior = JSON.parse(readFileSync(join(root, "relay-behavior.json"), "utf8"));
+  if (behavior.relayDelayMs) await new Promise((resolveDelay) => setTimeout(resolveDelay, behavior.relayDelayMs));
+  if (behavior.sendFails) {
+    process.stdout.write(JSON.stringify({ success: false, errorMsg: "模拟钉钉发送失败" }));
+    process.exitCode = 9;
+  } else {
   if (behavior.echoDuringRelay) {
     appendFileSync(join(root, "injected-events.jsonl"), JSON.stringify({
       type: "user_im_message_receive_group_all", message_id: "msgFixtureRelayedMessage",
@@ -129,6 +134,7 @@ if (args[0] === "event" && args[1] === "consume") {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 800));
   }
   process.stdout.write(JSON.stringify({ success: true, result: { messageId: "msgFixtureRelayedMessage" } }));
+  }
 } else if (args[0] === "chat" && args[1] === "+messages-create-text-emotion") {
   process.stdout.write(JSON.stringify({ success: true, result: { emotionId: "fixture-emotion-id" } }));
 } else if (args[0] === "chat" && args[1] === "+messages-add-text-emotion") {
@@ -156,8 +162,10 @@ if (args[0] === "event" && args[1] === "consume") {
         const envelope = JSON.parse(raw.toString());
         requests.push(envelope);
         const content = envelope.payload?.message?.content || "";
-        const shouldFail = envelope.method === "message.send" && failOnce && content.includes(failOnce) && !failed.has(failOnce);
-        if (shouldFail) failed.add(failOnce);
+        const isConfirmation = envelope.method === "message.reaction.set" && envelope.payload?.text === "✌️";
+        const shouldFailSend = envelope.method === "message.send" && failOnce && content.includes(failOnce) && !failed.has(failOnce);
+        const shouldFail = shouldFailSend || (isConfirmation && failConfirmation);
+        if (shouldFailSend) failed.add(failOnce);
         else if (envelope.method === "message.send" && envelope.payload?.target?.type === "topic") {
           delivered.push(content);
           deliveries.push(envelope.payload);
@@ -254,6 +262,12 @@ test("真实进程通过群事件补查 @，去重并向即应实时投递，发
   for (const marker of ["TARGET_FALLBACK", "NATIVE_DUPLICATE", "ALL_BROADCAST", "DIRECT_MESSAGE_RETRY"]) {
     assert.equal(app.delivered.filter((text) => text.includes(marker)).length, 1, marker);
   }
+  for (const marker of ["TARGET_FALLBACK", "NATIVE_DUPLICATE", "ALL_BROADCAST"]) {
+    const text = app.delivered.find((item) => item.includes(marker));
+    assert.ok(text.startsWith("**测试同事**："), "群消息发送人与正文显示在同一行");
+    assert.doesNotMatch(text, /^>/m, "话题群消息不再渲染成引用块");
+  }
+  assert.ok(app.delivered.includes("DIRECT_MESSAGE_RETRY"), "私聊话题只显示原正文");
   assert.equal(app.delivered.some((text) => text.includes("ORDINARY_DO_NOT_NOTIFY")), false);
   assert.ok(app.requests.some((item) => item.method === "message.send" && item.payload.target.type === "user" && item.payload.message.content === "集成验证群"), "用群名创建话题锚点");
   assert.ok(app.deliveries.every((item) => item.target.type === "topic"), "实际通知进入话题");
@@ -297,6 +311,48 @@ test("默认转发非免打扰群全量消息，免打扰群仍转发精确匹�
   assert.ok(settingsQueries.some((args) => args.includes("fixture-muted-group")), "免打扰群普通消息经过设置查询");
   assert.equal(settingsQueries.some((args) => args.includes("fixture-muted-native-only") || args.includes("fixture-muted-all-only")), false, "原生 @ 与 @所有人直接通知");
   assert.ok(calls.some((args) => args[1] === "+at-me" && args.includes("fixture-muted-group")), "免打扰群普通事件仍按消息 ID 补查 @");
+});
+
+test("全量群消息开启 muted_conversations 后，免打扰群普通消息也只转发一次", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    push: { all_group_messages: true, muted_conversations: true },
+    events: [
+      group("muted-opt-in", "MUTED_OPT_IN_ORDINARY"),
+      group("muted-opt-in", "MUTED_OPT_IN_ORDINARY"),
+      group("open-opt-in", "OPEN_OPT_IN_ORDINARY", undefined, "fixture-open-group"),
+      group("native-opt-in", "MUTED_OPT_IN_NATIVE", "user_im_message_receive_at"),
+      group("all-opt-in", "@所有人 MUTED_OPT_IN_ALL"),
+    ],
+  });
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return app.delivered.length === 4 && Object.keys(outbox?.delivered || {}).length === 4;
+  }, "开启免打扰转发后的普通消息和 @ 均完成投递", app.diagnostics);
+  for (const marker of ["MUTED_OPT_IN_ORDINARY", "OPEN_OPT_IN_ORDINARY", "MUTED_OPT_IN_NATIVE", "MUTED_OPT_IN_ALL"]) {
+    assert.equal(app.delivered.filter((text) => text.includes(marker)).length, 1, marker);
+  }
+});
+
+test("仅提及模式下 muted_conversations 不会把普通群消息当成 @", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    push: { all_group_messages: false, muted_conversations: true },
+    events: [
+      group("muted-mention-only-ordinary", "MUTED_MENTION_ONLY_ORDINARY"),
+      group("open-mention-only-ordinary", "OPEN_MENTION_ONLY_ORDINARY", undefined, "fixture-open-group"),
+      group("muted-mention-only-fallback", "MUTED_MENTION_ONLY_FALLBACK"),
+      group("muted-mention-only-native", "MUTED_MENTION_ONLY_NATIVE", "user_im_message_receive_at"),
+      group("muted-mention-only-all", "@所有人 MUTED_MENTION_ONLY_ALL"),
+    ],
+    mentions: [{ messageId: "muted-mention-only-fallback", conversationId: "fixture-muted-group" }],
+  });
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return app.delivered.length === 3 && Object.keys(outbox?.delivered || {}).length === 3;
+  }, "仅提及模式的三类 @ 均完成投递", app.diagnostics);
+  for (const marker of ["MUTED_MENTION_ONLY_FALLBACK", "MUTED_MENTION_ONLY_NATIVE", "MUTED_MENTION_ONLY_ALL"]) {
+    assert.equal(app.delivered.filter((text) => text.includes(marker)).length, 1, marker);
+  }
+  assert.equal(app.delivered.some((text) => text.includes("MENTION_ONLY_ORDINARY")), false, "免打扰开关不扩大仅提及模式的范围");
 });
 
 test("即应初始离线时真实进程先收取并持久化，连接恢复后自动投递", { timeout: 15_000 }, async (t) => {
@@ -346,15 +402,21 @@ test("图片失败后仅重试图片，同一钉钉会话复用即应话题", { 
 test("仅 owner 的话题文字直接转发回绑定钉钉群，并防止重复转发", { timeout: 15_000 }, async (t) => {
   const app = await fixture(t, {
     events: [group("reply-source", "CREATE_REPLY_TOPIC", "user_im_message_receive_at")],
+    relayDelayMs: 400,
   });
   await waitFor(async () => {
     const outbox = await app.readOutbox();
     return Object.keys(outbox?.delivered || {}).length === 1;
   }, "话题创建并送达", app.diagnostics);
   const topicId = app.deliveries[0].target.conversation_id;
+  const confirmations = () => app.requests.filter((item) => item.method === "message.reaction.set" && item.payload?.text === "✌️");
   await app.emitMessage({ topicId, text: "NON_OWNER_MUST_NOT_RELAY", senderId: "another-user", messageId: "foreign-reply" });
   assert.equal((await app.calls()).filter((args) => args[1] === "+messages-send").length, 0);
-  await app.emitMessage({ topicId, text: "OWNER_REPLY_DIRECT", messageId: "owner-reply" });
+  assert.equal(confirmations().length, 0, "非 owner 的消息不贴发送成功确认");
+  const sending = app.emitMessage({ topicId, text: "OWNER_REPLY_DIRECT", messageId: "owner-reply" });
+  await waitFor(async () => (await app.calls()).some((args) => args[1] === "+messages-send"), "钉钉开始发送回复", app.diagnostics);
+  assert.equal(confirmations().length, 0, "钉钉尚未返回成功回执时不提前确认");
+  await sending;
   await app.emitMessage({ topicId, text: "OWNER_REPLY_DIRECT", messageId: "owner-reply" });
   const relays = (await app.calls()).filter((args) => args[0] === "chat" && args[1] === "+messages-send");
   assert.equal(relays.length, 1);
@@ -366,6 +428,41 @@ test("仅 owner 的话题文字直接转发回绑定钉钉群，并防止重复�
   const stamps = (await app.calls()).filter((args) => args[1] === "+messages-add-text-emotion");
   assert.equal(stamps.length, 1, "成功回复只贴一次使用即应发送标记");
   assert.equal(stamps[0][stamps[0].indexOf("--msg-id") + 1], "msgFixtureRelayedMessage");
+  assert.equal(confirmations().length, 1, "owner 同一回复在即应只确认一次");
+  assert.deepEqual(confirmations()[0].payload, {
+    conversation_id: topicId, message_id: "owner-reply", text: "✌️", reacted: true,
+  }, "确认贴在 owner 的原话题原消息上");
+});
+
+test("钉钉发送失败不贴即应成功确认，并向 owner 说明失败", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [group("failed-reply-source", "CREATE_FAILED_REPLY_TOPIC", "user_im_message_receive_at")],
+    sendFails: true,
+  });
+  await waitFor(async () => Object.keys((await app.readOutbox())?.delivered || {}).length === 1, "失败回复测试的话题已创建", app.diagnostics);
+  const topicId = app.deliveries[0].target.conversation_id;
+  await app.emitMessage({ topicId, text: "OWNER_REPLY_SEND_FAILS", messageId: "failed-owner-reply" });
+  const calls = await app.calls();
+  assert.equal(calls.filter((args) => args[1] === "+messages-send").length, 1, "本次回复只尝试发送一次");
+  assert.equal(calls.filter((args) => args[1] === "+messages-add-text-emotion").length, 0, "失败发送不能贴钉钉成功标记");
+  assert.equal(app.requests.filter((item) => item.method === "message.reaction.set" && item.payload?.text === "✌️").length, 0);
+  assert.equal(app.delivered.filter((text) => text.includes("转发到钉钉失败")).length, 1, "向 owner 返回一次发送失败说明");
+});
+
+test("即应成功确认失败不影响已送达的回复，也不提示转发失败或重发", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [group("confirmation-fail-source", "CREATE_CONFIRMATION_FAIL_TOPIC", "user_im_message_receive_at")],
+    failConfirmation: true,
+  });
+  await waitFor(async () => Object.keys((await app.readOutbox())?.delivered || {}).length === 1, "确认失败测试的话题已创建", app.diagnostics);
+  const topicId = app.deliveries[0].target.conversation_id;
+  await app.emitMessage({ topicId, text: "OWNER_REPLY_CONFIRMATION_FAILS", messageId: "confirmation-failed-owner-reply" });
+  await app.emitMessage({ topicId, text: "OWNER_REPLY_CONFIRMATION_FAILS", messageId: "confirmation-failed-owner-reply" });
+  const calls = await app.calls();
+  assert.equal(calls.filter((args) => args[1] === "+messages-send").length, 1, "确认失败不会让已送达回复重发");
+  assert.equal(calls.filter((args) => args[1] === "+messages-add-text-emotion").length, 1);
+  assert.equal(app.requests.filter((item) => item.method === "message.reaction.set" && item.payload?.text === "✌️").length, 1, "只尝试确认原回复一次");
+  assert.equal(app.delivered.some((text) => text.includes("转发到钉钉失败")), false, "成功送达后的确认失败不冒充发送失败");
 });
 
 test("owner 在话题的回复发到钉钉后，同一出站消息的群事件不再次引用回即应", { timeout: 15_000 }, async (t) => {

@@ -106,9 +106,11 @@ async function main() {
     fetchMentions,
     forwardGroup: async (groupId, events) => {
       if (config.push.all_group_messages === false) return false;
-      const muted = await isMuted(groupId);
-      if (muted == null) throw new Error("未能确认群免打扰设置，保留消息后重试");
-      if (muted) return false;
+      if (config.push.muted_conversations !== true) {
+        const muted = await isMuted(groupId);
+        if (muted == null) throw new Error("未能确认群免打扰设置，保留消息后重试");
+        if (muted) return false;
+      }
       for (const event of events) await forwarder.enqueue(event, "group");
       return true;
     },
@@ -290,9 +292,22 @@ async function relayTopicReply(payload) {
       seen[messageId] = Date.now();
       await saveJson(seenPath, seen);
     }
+    await markTopicSent(payload);
   } catch (error) {
     await delivery.sendToTopic(topicId, "转发到钉钉失败：" + error.message);
   }
+}
+
+async function markTopicSent(payload) {
+  const conversationId = payload.conversation?.id;
+  const messageId = payload.message?.id;
+  if (!conversationId || !messageId) return;
+  await chat.request("message.reaction.set", {
+    conversation_id: conversationId,
+    message_id: messageId,
+    text: "✌️",
+    reacted: true,
+  }).catch((error) => console.error("贴发送成功表情失败：", error.message));
 }
 
 async function sendText(text) {
@@ -306,7 +321,7 @@ function listen(delay) {
       onReady: () => {
         restartDelay = 1000;
         console.log("钉钉实时监听已就绪：私聊、群聊@我、@所有人。");
-        console.log("群消息推送模式：" + (config.push.all_group_messages === false ? "仅提及" : "全部非免打扰群") + "；免打扰群被 @ 仍通知。");
+        console.log("群消息推送模式：" + (config.push.all_group_messages === false ? "仅提及" : config.push.muted_conversations === true ? "全部群" : "全部非免打扰群") + "；免打扰群被 @ 仍通知。");
       },
       onEvent: (event) => {
         const task = handleDingTalk(event).catch((error) => console.error("接收钉钉通知失败：", error.message));

@@ -34,8 +34,10 @@ export async function loadConfig(path) {
   config.agent.max_context_tokens = Number(config.agent.max_context_tokens) || 100_000;
   config.push = {
     all_group_messages: true,
+    muted_conversations: false,
     ...(config.push || {}),
   };
   if (config.push.all_group_messages == null) config.push.all_group_messages = true;
+  if (config.push.muted_conversations == null) config.push.muted_conversations = false;
   return config;
 }

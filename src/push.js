@@ -109,11 +109,14 @@ export function formatMainPush(event, reason, conversationName = "") {
   return `${formatMainCaption(event, reason, conversationName)}\n\n${body}`;
 }
 
+export function formatTopicSender(event) {
+  return `**${clean(event?.sender) || "未知发送人"}**：`;
+}
+
 export function formatTopicPush(event, reason) {
   const body = messageBody(event);
   if (reason === "dm") return body;
-  const sender = clean(event?.sender) || "未知发送人";
-  return `> **${sender}**：\n\n${body}`;
+  return `${formatTopicSender(event)}${body}`;
 }
 
 export function pushIndexLine(event, reason, conversationName = "") {

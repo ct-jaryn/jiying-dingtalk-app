@@ -82,7 +82,7 @@ test("runDws rejects business failures even when the process succeeds", async (t
 
 test("runDws times out and safely handles a missing executable", async (t) => {
   const bin = await fakeDws(t, "setInterval(() => {}, 1000);");
-  await assert.rejects(runDws(["chat"], { bin, timeoutMs: 50 }), { code: "ETIMEDOUT" });
+  await assert.rejects(runDws(["chat"], { bin, timeoutMs: 50, retries: 0 }), { code: "ETIMEDOUT" });
   await assert.rejects(runDws(["chat"], { bin: `${bin}.missing`, timeoutMs: 100 }), { code: "ENOENT" });
 });
 
