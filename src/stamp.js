@@ -115,7 +115,7 @@ function receiptChildren(value) {
   const priority = ["delivery", "receipt", "message", "result", "data"];
   return Object.entries(value)
     // This context identifies the quoted source, never the message just sent.
-    .filter(([key, child]) => !/^referenced[_-]?messages?$/i.test(key) && child && typeof child === "object")
+    .filter(([key, child]) => !/^(?:(?:referenced|quoted?|forward(?:ed)?|source|original)[_-]?messages?|(?:in[_-]?)?reply[_-]?to(?:[_-]?message)?|quote|replyContext)$/i.test(key) && child && typeof child === "object")
     .sort(([left], [right]) => {
       const rank = (key) => {
         const index = priority.indexOf(key.toLowerCase());

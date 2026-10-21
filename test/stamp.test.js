@@ -35,7 +35,7 @@ test("legacy nested payloads inherit the enclosing conversation", () => {
 });
 
 test("quoted source alone never becomes the sent message", () => {
-  for (const key of ["referencedMessage", "referenced_message", "referencedMessages"]) {
+  for (const key of ["referencedMessage", "referenced_message", "referencedMessages", "quotedMessage", "quote_message", "forwardedMessages", "forward_messages", "sourceMessage", "original_message", "replyToMessage", "in_reply_to", "quote", "replyContext"]) {
     assert.deepEqual(sentMessageRef({ result: {
       [key]: { messageId: "msgSOURCE", conversationId: "cidSOURCE" },
     } }, "cidFALLBACK"), { messageId: "", conversationId: "cidFALLBACK" });

@@ -7,7 +7,7 @@ import { stampSentMessage } from "./stamp.js";
 const DOWNLOAD_TIMEOUT_MS = 20_000;
 
 // The caller verifies the owner and resolves the DingTalk topic before relaying.
-export function createTopicRelay({ chat, root, emotionPath = resolve(root, "data/emotion.json") }) {
+export function createTopicRelay({ chat, root, emotionPath = resolve(root, "data/emotion.json"), outbound }) {
   const outboundRoot = resolve(root, "data/outbound");
 
   return async function relay(payload, record) {
@@ -39,11 +39,14 @@ export function createTopicRelay({ chat, root, emotionPath = resolve(root, "data
       contentArgs = ["--text", text];
     }
 
-    const sent = await runDws([
+    const execute = () => runDws([
       "chat", "+messages-send", "--as", "user", "--ai-tag=false",
       ...targetArgs, ...contentArgs, "--wait-delivery",
       "--idempotency-key", String(messageId || "relay").replace(/[^A-Za-z0-9]/g, "").slice(0, 32) || "relay",
     ], { timeoutMs: 60_000 });
+    const sent = outbound
+      ? await outbound.send(execute, { conversationId: record.dingTalkConversationId })
+      : await execute();
     // A failed decoration must not cause the already-delivered message to resend.
     await stampSentMessage(sent.data, {
       conversationId: record.dingTalkConversationId,

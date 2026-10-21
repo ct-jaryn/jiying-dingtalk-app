@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, cp, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, cp, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -38,6 +38,7 @@ async function unusedPort() {
 
 async function fixture(t, {
   events = [], mentions = [], port = 0, initiallyOffline = false, failOnce = "", push,
+  echoDuringRelay = false, failStamp = false,
   groupSettings = { "fixture-muted-group": 1, "fixture-open-group": 0 },
 }) {
   const directory = await mkdtemp(join(tmpdir(), "jiying-realtime-test-"));
@@ -80,11 +81,13 @@ async function fixture(t, {
   await symlink(join(project, "node_modules"), join(directory, "node_modules"), "dir");
   await mkdir(join(directory, "bin"));
   await writeFile(join(directory, "events.json"), JSON.stringify(events));
+  await writeFile(join(directory, "injected-events.jsonl"), "");
   await writeFile(join(directory, "mentions.json"), JSON.stringify(mentions));
   await writeFile(join(directory, "group-settings.json"), JSON.stringify(groupSettings));
+  await writeFile(join(directory, "relay-behavior.json"), JSON.stringify({ echoDuringRelay, failStamp }));
   const fakeDws = join(directory, "bin", "dws");
   await writeFile(fakeDws, `#!${process.execPath}
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, watchFile, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const args = process.argv.slice(2);
 const root = process.env.REALTIME_FIXTURE_ROOT;
@@ -95,6 +98,12 @@ if (args[0] === "event" && args[1] === "consume") {
   for (const event of JSON.parse(readFileSync(join(root, "events.json"), "utf8"))) {
     process.stdout.write(JSON.stringify(event) + "\\n");
   }
+  let injected = 0;
+  watchFile(join(root, "injected-events.jsonl"), { interval: 10 }, () => {
+    const events = readFileSync(join(root, "injected-events.jsonl"), "utf8").trim().split("\\n").filter(Boolean);
+    for (; injected < events.length; injected += 1) process.stdout.write(events[injected] + "\\n");
+    writeFileSync(join(root, "injected-count.json"), String(injected));
+  });
   setInterval(() => {}, 1000);
 } else if (args[0] === "chat" && args[1] === "+at-me") {
   process.stdout.write(JSON.stringify({ items: JSON.parse(readFileSync(join(root, "mentions.json"), "utf8")), complete: true }));
@@ -109,11 +118,23 @@ if (args[0] === "event" && args[1] === "consume") {
 } else if (args[0] === "chat" && args[1] === "message" && args[2] === "download-media") {
   process.stdout.write(JSON.stringify({ downloadUrl: "https://fixture.invalid/image.png" }));
 } else if (args[0] === "chat" && args[1] === "+messages-send") {
+  const behavior = JSON.parse(readFileSync(join(root, "relay-behavior.json"), "utf8"));
+  if (behavior.echoDuringRelay) {
+    appendFileSync(join(root, "injected-events.jsonl"), JSON.stringify({
+      type: "user_im_message_receive_group_all", message_id: "msgFixtureRelayedMessage",
+      conversation_id: args[args.indexOf("--group") + 1], sender: "当前用户",
+      content: args[args.indexOf("--text") + 1], timestamp: Date.now(),
+    }) + "\\n");
+    // A live event can arrive well before --wait-delivery has produced its receipt.
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 800));
+  }
   process.stdout.write(JSON.stringify({ success: true, result: { messageId: "msgFixtureRelayedMessage" } }));
 } else if (args[0] === "chat" && args[1] === "+messages-create-text-emotion") {
   process.stdout.write(JSON.stringify({ success: true, result: { emotionId: "fixture-emotion-id" } }));
 } else if (args[0] === "chat" && args[1] === "+messages-add-text-emotion") {
-  process.stdout.write(JSON.stringify({ success: true }));
+  const behavior = JSON.parse(readFileSync(join(root, "relay-behavior.json"), "utf8"));
+  process.stdout.write(JSON.stringify(behavior.failStamp ? { success: false, errorMsg: "模拟贴表情失败" } : { success: true }));
+  if (behavior.failStamp) process.exitCode = 9;
 } else {
   process.stdout.write(JSON.stringify({ success: false, errorMsg: "不应调用的 fixture 命令: " + args.join(" ") }));
   process.exitCode = 9;
@@ -179,6 +200,11 @@ if (args[0] === "event" && args[1] === "consume") {
   return {
     directory, delivered, deliveries, requests, failed, diagnostics, startServer,
     readOutbox: () => readJson(join(directory, "data", "push-outbox.json"), null),
+    async emitDingTalk(event) {
+      await appendFile(join(directory, "injected-events.jsonl"), JSON.stringify(event) + "\n");
+      const count = (await readFile(join(directory, "injected-events.jsonl"), "utf8")).trim().split("\n").filter(Boolean).length;
+      await waitFor(async () => (await readJson(join(directory, "injected-count.json"), 0)) >= count, "钉钉事件注入监听进程", diagnostics);
+    },
     async emitMessage({ topicId, text, senderId = "dummy-user", messageId = `fixture-inbound-${++nextEvent}` }) {
       await waitFor(() => sockets.size > 0, "即应客户端连接", diagnostics);
       const cursor = `fixture-cursor-${++nextEvent}`;
@@ -340,4 +366,51 @@ test("仅 owner 的话题文字直接转发回绑定钉钉群，并防止重复�
   const stamps = (await app.calls()).filter((args) => args[1] === "+messages-add-text-emotion");
   assert.equal(stamps.length, 1, "成功回复只贴一次使用即应发送标记");
   assert.equal(stamps[0][stamps[0].indexOf("--msg-id") + 1], "msgFixtureRelayedMessage");
+});
+
+test("owner 在话题的回复发到钉钉后，同一出站消息的群事件不再次引用回即应", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [group("reply-source", "CREATE_OPEN_GROUP_REPLY_TOPIC", undefined, "fixture-open-group")],
+  });
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return Object.keys(outbox?.delivered || {}).length === 1;
+  }, "非免打扰群的话题创建并送达", app.diagnostics);
+  const topicId = app.deliveries[0].target.conversation_id;
+  await app.emitMessage({ topicId, text: "OWNER_REPLY_MUST_NOT_ECHO", messageId: "owner-reply-no-echo" });
+  assert.equal((await app.calls()).filter((args) => args[1] === "+messages-send").length, 1);
+
+  // This is the sender's own DingTalk event for the receipt returned by the
+  // outbound CLI. It has a different ID from the owner's MagicChat message.
+  await app.emitDingTalk({
+    ...group("msgFixtureRelayedMessage", "OWNER_REPLY_MUST_NOT_ECHO", undefined, "fixture-open-group"),
+    sender: "当前用户",
+  });
+  // The real process debounces group events for 250 ms before deciding whether
+  // to forward them. Allow that path to finish before checking the topic.
+  await pause(1200);
+  assert.equal(app.delivered.some((text) => text.includes("OWNER_REPLY_MUST_NOT_ECHO")), false, "owner 已发送的内容不应又以机器人引用显示");
+  assert.equal(app.deliveries.length, 1, "只有同事发来的初始消息进入话题");
+});
+
+test("出站群事件早于发送回执且贴表情失败时，仍排除回流并保留同事同文消息", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [group("early-reply-source", "CREATE_EARLY_REPLY_TOPIC", undefined, "fixture-open-group")],
+    echoDuringRelay: true,
+    failStamp: true,
+  });
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return Object.keys(outbox?.delivered || {}).length === 1;
+  }, "话题创建并送达", app.diagnostics);
+  const topicId = app.deliveries[0].target.conversation_id;
+  await app.emitMessage({ topicId, text: "EARLY_OWNER_REPLY", messageId: "early-owner-reply" });
+  await pause(600);
+  assert.equal(app.delivered.some((text) => text.includes("EARLY_OWNER_REPLY")), false, "等待发送回执期间收到的出站消息也不能回流");
+  assert.equal((await app.calls()).filter((args) => args[1] === "+messages-send").length, 1, "贴表情失败不会导致重发");
+  assert.equal(app.delivered.some((text) => text.includes("转发到钉钉失败")), false, "发送成功后的贴表情失败不提示转发失败");
+
+  await app.emitDingTalk(group("colleague-same-text", "EARLY_OWNER_REPLY", undefined, "fixture-open-group"));
+  await waitFor(() => app.delivered.some((text) => text.includes("EARLY_OWNER_REPLY")), "同事相同文本的不同消息正常转发", app.diagnostics);
+  assert.equal(app.delivered.filter((text) => text.includes("EARLY_OWNER_REPLY")).length, 1, "不能按文本过滤别人的独立消息");
 });

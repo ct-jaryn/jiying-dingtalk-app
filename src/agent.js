@@ -11,7 +11,7 @@ const STATUS = {
   reply_message: "正在回复消息",
 };
 
-export async function runAgent({ config, session, pushIndex, instruction, status, complete }) {
+export async function runAgent({ config, session, pushIndex, instruction, status, complete, outbound }) {
   await compressSession(config, session, pushIndex);
   const messages = toAnthropicMessages(visibleHistory(session.messages), instruction);
   const seen = new Set();
@@ -34,7 +34,7 @@ export async function runAgent({ config, session, pushIndex, instruction, status
       else {
         seen.add(key);
         try {
-          const result = await executeTool(tool.name, tool.input || {});
+          const result = await executeTool(tool.name, tool.input || {}, { outbound });
           output = clip(JSON.stringify(result.data ?? result));
         } catch (error) {
           output = `工具失败：${error.message}`;

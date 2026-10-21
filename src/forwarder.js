@@ -7,6 +7,8 @@ export function createPushForwarder({
   saveState,
   render,
   send,
+  shouldSkip = () => false,
+  onSkipped = () => {},
   onDelivered = () => {},
   onLog = () => {},
   retryDelayMs = 1000,
@@ -88,6 +90,10 @@ export function createPushForwarder({
 
   async function deliver(key) {
     let item = entryFor(key);
+    if (await shouldSkip(item.event)) {
+      await finish(key, true);
+      return;
+    }
     if (!Array.isArray(item.parts)) {
       const rendered = await render(item.event, item.reason);
       const parts = typeof rendered === "string" ? [rendered] : rendered;
@@ -111,7 +117,11 @@ export function createPushForwarder({
       item = entryFor(key);
     }
     if (item.nextPart < item.parts.length) return;
-    const { event, reason } = item;
+    await finish(key, false);
+  }
+
+  async function finish(key, skipped) {
+    const { event, reason } = entryFor(key);
     await change((draft) => {
       draft.pending = draft.pending.filter((entry) => entry.key !== key);
       draft.delivered[key] = now();
@@ -124,9 +134,9 @@ export function createPushForwarder({
     retryAt.delete(key);
     forced.delete(key);
     try {
-      await onDelivered(event, reason);
+      await (skipped ? onSkipped : onDelivered)(event, reason);
     } catch (error) {
-      log("通知已投递，但保存推送索引失败", error);
+      log(skipped ? "记录已忽略的回流消息失败" : "通知已投递，但保存推送索引失败", error);
     }
   }
 

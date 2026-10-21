@@ -83,7 +83,7 @@ export function toolKey(name, input) {
   return `${name}:${createHash("sha256").update(JSON.stringify(sortKeys(input || {}))).digest("hex")}`;
 }
 
-export async function executeTool(name, input) {
+export async function executeTool(name, input, { outbound } = {}) {
   switch (name) {
     case "list_unread":
       return runDws(["chat", "message", "list-unread-conversations", "--count", String(input.count || 30)]);
@@ -98,16 +98,17 @@ export async function executeTool(name, input) {
         ? runDws(["chat", "+chat-search", "--query", input.query])
         : runDws(["contact", "user", "search", "--query", input.query]);
     case "send_message":
-      return sendAndStamp(["chat", "+messages-send", "--as", "user", "--ai-tag=false", "--wait-delivery", ...sendArgs(input), "--idempotency-key", toolKey(name, input).slice(0, 32)], input.conversation_id);
+      return sendAndStamp(["chat", "+messages-send", "--as", "user", "--ai-tag=false", "--wait-delivery", ...sendArgs(input), "--idempotency-key", toolKey(name, input).slice(0, 32)], input.conversation_id, outbound);
     case "reply_message":
-      return sendAndStamp(["chat", "+messages-reply", "--as", "user", "--ai-tag=false", "--wait-delivery", "--message-id", input.message_id, "--content", input.text, ...(input.conversation_id ? ["--group", input.conversation_id] : []), "--idempotency-key", toolKey(name, input).slice(0, 32)], input.conversation_id);
+      return sendAndStamp(["chat", "+messages-reply", "--as", "user", "--ai-tag=false", "--wait-delivery", "--message-id", input.message_id, "--content", input.text, ...(input.conversation_id ? ["--group", input.conversation_id] : []), "--idempotency-key", toolKey(name, input).slice(0, 32)], input.conversation_id, outbound);
     default:
       throw new Error(`未知工具 ${name}`);
   }
 }
 
-async function sendAndStamp(args, conversationId) {
-  const sent = await runDws(args, { timeoutMs: 60_000 });
+async function sendAndStamp(args, conversationId, outbound) {
+  const execute = () => runDws(args, { timeoutMs: 60_000 });
+  const sent = outbound ? await outbound.send(execute, { conversationId }) : await execute();
   await stampSentMessage(sent.data, {
     conversationId,
     emotionPath: resolve("data/emotion.json"),

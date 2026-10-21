@@ -8,6 +8,7 @@ import { createPushForwarder } from "./forwarder.js";
 import { MagicChat, startStatus } from "./magicchat.js";
 import { createMentionLookup } from "./mention-source.js";
 import { createMentionResolver } from "./mentions.js";
+import { createOutboundGuard } from "./outbound.js";
 import { classify, conversationNameFrom, isAtAll, mutedForConversation, normalizeEvent, pushIndexLine, wasDeliveredInLegacyHistory } from "./push.js";
 import { createTopicRelay } from "./relay.js";
 import { appendVisible, rememberPush } from "./session.js";
@@ -21,6 +22,7 @@ const seenPath = resolve(root, "data/seen.json");
 const outboxPath = resolve(root, "data/push-outbox.json");
 const mentionPath = resolve(root, "data/pending-mentions.json");
 const topicsPath = resolve(root, "data/topics.json");
+const outboundPath = resolve(root, "data/outbound-sent.json");
 
 let config;
 let chat;
@@ -32,6 +34,7 @@ let mentions;
 let topics;
 let delivery;
 let relay;
+let outbound;
 let stopped = false;
 let connecting = false;
 let stream;
@@ -50,6 +53,12 @@ async function main() {
   seen = await loadJson(seenPath, {});
   const outbox = await loadJson(outboxPath, { pending: [], delivered: {} });
   const pendingMentions = await loadJson(mentionPath, { pending: [] });
+  const outboundState = await loadJson(outboundPath, { sent: {} });
+  outbound = createOutboundGuard({
+    state: outboundState,
+    saveState: (state) => saveJson(outboundPath, state),
+    onLog: logIssue,
+  });
   topics = await loadJson(topicsPath, emptyTopics());
   topics.byDingTalk ||= {};
   chat = new MagicChat({
@@ -64,12 +73,14 @@ async function main() {
     saveTopics: (state) => saveJson(topicsPath, state),
     resolveName: dingTalkTitle,
   });
-  relay = createTopicRelay({ chat, root, emotionPath: resolve(root, "data/emotion.json") });
+  relay = createTopicRelay({ chat, root, emotionPath: resolve(root, "data/emotion.json"), outbound });
   forwarder = createPushForwarder({
     state: outbox,
     saveState: (state) => saveJson(outboxPath, state),
     render: delivery.render,
     send: delivery.send,
+    shouldSkip: (event) => outbound.isSent(event),
+    onSkipped: logSuppressedEcho,
     onDelivered: async (event, reason) => {
       console.log("[通知已送达] reason=" + reason + " message=" + event.message_id + " group=" + (event.conversation_id || ""));
       pushes = rememberPush(pushes, pushIndexLine(event, reason, topicFor(topics, event.conversation_id)?.name || event.conversation_name || names.get(event.conversation_id) || ""));
@@ -190,6 +201,7 @@ async function handleUserMessage(payload) {
       pushIndex: pushes,
       instruction: String(instruction),
       status,
+      outbound,
     });
     await sendText(reply);
     appendVisible(session, "user", String(instruction));
@@ -208,6 +220,10 @@ async function handleDingTalk(raw) {
   const event = normalizeEvent(raw);
   const id = event.message_id || event.event_id;
   if (!id || wasDeliveredInLegacyHistory(event, seen, pushes)) return;
+  if (await outbound.isSent(event)) {
+    logSuppressedEcho(event);
+    return;
+  }
   if (event.conversation_name) names.set(event.conversation_id, event.conversation_name);
   const reason = classify(event, { allGroupMessages: config.push.all_group_messages !== false });
   if (reason && reason !== "group") {
@@ -314,6 +330,10 @@ function logIssue(message, error) {
   console.error(message + (error?.message ? "：" + error.message : ""));
 }
 
+function logSuppressedEcho(event) {
+  console.log("[已忽略出站回流] message=" + (event.message_id || event.event_id || "") + " group=" + (event.conversation_id || ""));
+}
+
 function sleep(ms) {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
@@ -331,7 +351,7 @@ async function shutdown() {
   forwarder?.stop();
   chat?.close();
   await Promise.race([
-    Promise.allSettled([mentions?.waitForIdle(), forwarder?.waitForIdle(), flushWrites()]),
+    Promise.allSettled([mentions?.waitForIdle(), forwarder?.waitForIdle(), outbound?.waitForIdle(), flushWrites()]),
     sleep(3000),
   ]);
   process.exit(0);

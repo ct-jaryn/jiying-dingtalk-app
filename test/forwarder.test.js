@@ -203,3 +203,40 @@ test("完成状态落盘失败后只重试提交，不重新发送已经确认�
   assert.equal(state.pending.length, 0);
   assert.equal(Object.keys(state.delivered).length, 1);
 });
+
+test("回流事件在渲染前清理，不发消息或写入已送达索引", async (t) => {
+  let rendered = 0;
+  let indexed = 0;
+  const skipped = [];
+  const app = fixture(t, {
+    shouldSkip: async (item) => item.message_id === "my-outbound",
+    render: () => { rendered++; throw new Error("出站回流不应读取图片或生成通知"); },
+    onDelivered: () => { indexed++; },
+    onSkipped: (item) => { skipped.push(item.message_id); },
+  });
+  await app.forwarder.enqueue(event("my-outbound"), "group");
+  await app.forwarder.waitForIdle();
+  await app.forwarder.enqueue(event("my-outbound"), "group");
+  await app.forwarder.waitForIdle();
+  assert.equal(rendered, 0);
+  assert.equal(indexed, 0);
+  assert.equal(app.sent.length, 0);
+  assert.equal(app.state.pending.length, 0);
+  assert.deepEqual(skipped, ["my-outbound"]);
+});
+
+test("重启恢复的出站回流分块也不再续发，其他消息继续发送", async (t) => {
+  const first = fixture(t, { send: async () => { throw new Error("offline"); } });
+  await first.forwarder.enqueue(event("my-outbound"), "group");
+  await first.forwarder.waitForIdle();
+  first.forwarder.stop();
+  const next = fixture(t, {
+    state: structuredClone(first.state),
+    shouldSkip: async (item) => item.message_id === "my-outbound",
+  });
+  next.forwarder.wake();
+  await next.forwarder.enqueue(event("other-person"), "group");
+  await next.forwarder.waitForIdle();
+  assert.deepEqual(next.sent.map((item) => item.event.message_id), ["other-person"]);
+  assert.equal(next.state.pending.length, 0);
+});
