@@ -29,7 +29,11 @@ async function main() {
   session = await loadJson(sessionPath, { summary: "", messages: [] });
   pushes = await loadJson(pushPath, []);
   seen = await loadJson(seenPath, {});
-  chat = new MagicChat(config.magicchat);
+  chat = new MagicChat({
+    url: config.magicchat.ws_url,
+    appId: config.magicchat.app_id,
+    secret: config.magicchat.app_secret,
+  });
   chat.onEvent = (envelope) => {
     inbound = inbound.then(() => handleInbound(envelope)).catch((error) => console.error(error));
     return inbound;
