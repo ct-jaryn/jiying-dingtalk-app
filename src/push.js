@@ -21,6 +21,7 @@ export function normalizeEvent(input) {
     conversation_id: clean(event.conversation_id || event.conversationId || event.openConversationId || event.conversation?.openConversationId || event.conversation?.id),
     conversation_name: clean(event.conversation_name || event.conversationName || event.conversation?.name || event.conversation?.title),
     sender: clean(sender && typeof sender === "object" ? sender.name || sender.displayName || sender.userName || sender.id : sender),
+    sender_open_dingtalk_id: clean(event.sender_open_dingtalk_id || event.senderOpenDingtalkId || (sender && typeof sender === "object" ? sender.openDingTalkId || sender.open_dingtalk_id : "")),
     content: clean(body),
     event_time: event.event_time || event.create_time || event.createTime || event.timestamp || event.time,
   };
@@ -45,11 +46,22 @@ export function wasDeliveredInLegacyHistory(event, seen, pushes) {
 }
 
 export function isAtAll(event) {
-  const content = clean(event?.content || event?.text);
+  const content = `${clean(event?.content)}\n${clean(event?.text)}`;
   if (content.includes("@所有人") || content.includes("@全体")) return true;
   if (/(^|[\s\u00a0\u2005\u200b])@all\b/i.test(content)) return true;
   const markers = ["atAll", "at_all", "isAtAll", "is_at_all"];
   return [event, event?.extension, event?.metadata].some((value) => value && markers.some((key) => value[key] === true));
+}
+
+export function conversationTitle(payload) {
+  const candidates = [payload?.result?.conversationInfo, payload?.conversationInfo,
+    payload?.result?.conversation, payload?.conversation, payload?.result, payload];
+  for (const value of candidates) {
+    const name = [value?.title, value?.name, value?.conversationTitle, value?.group_name]
+      .map(clean).find(Boolean);
+    if (name) return name;
+  }
+  return "";
 }
 
 export function mutedForConversation(payload, conversationId) {
@@ -60,15 +72,15 @@ export function mutedForConversation(payload, conversationId) {
 }
 
 export function conversationNameFrom(payload) {
-  const value = payload?.result?.conversationInfo || payload?.conversationInfo
-    || payload?.result?.conversation || payload?.conversation || payload?.result || payload;
-  return clean(value?.title || value?.name || value?.group_name);
+  return conversationTitle(payload);
 }
 
-export function formatPush(event, reason, conversationName = "") {
+export function formatPush(event, reason, conversationName = "", options = {}) {
+  if (options.topic === true) return formatTopicPush(event, reason);
+  if (options.topic === false) return formatMainPush(event, reason, conversationName);
   const sender = clean(event?.sender) || "未知发送人";
   const where = conversationName ? "在 " + conversationName : "";
-  const body = clean(event?.content || event?.text) || "（没有可显示的正文，可能是图片、文件或卡片）";
+  const body = messageBody(event);
   return [
     "**钉钉通知 · " + (REASONS[reason] || "相关消息") + "**",
     "**" + sender + "**" + (where ? " " + where : ""),
@@ -76,6 +88,29 @@ export function formatPush(event, reason, conversationName = "") {
     "",
     body,
   ].filter((line, index) => line !== "" || index > 2).join("\n");
+}
+
+export function messageBody(event) {
+  return clean(event?.content || event?.text) || "（没有可显示的正文，可能是图片、文件或卡片）";
+}
+
+export function formatMainCaption(event, reason, conversationName = "") {
+  const name = conversationName || "未知会话";
+  if (reason === "dm") return `> 收到来自 **${name}** 的消息`;
+  const sender = clean(event?.sender) || "未知发送人";
+  return `> 收到来自 **${sender}** 在 **${name}** 的消息`;
+}
+
+export function formatMainPush(event, reason, conversationName = "") {
+  const body = messageBody(event);
+  return `${formatMainCaption(event, reason, conversationName)}\n\n${body}`;
+}
+
+export function formatTopicPush(event, reason) {
+  const body = messageBody(event);
+  if (reason === "dm") return body;
+  const sender = clean(event?.sender) || "未知发送人";
+  return `> **${sender}**：\n\n${body}`;
 }
 
 export function pushIndexLine(event, reason, conversationName = "") {

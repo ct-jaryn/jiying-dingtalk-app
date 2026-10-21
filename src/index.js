@@ -3,13 +3,15 @@ import { fileURLToPath } from "node:url";
 import { runAgent } from "./agent.js";
 import { loadConfig } from "./config.js";
 import { runDws, startEventStream } from "./dws.js";
+import { createNotificationDelivery } from "./delivery.js";
 import { createPushForwarder } from "./forwarder.js";
 import { MagicChat, startStatus } from "./magicchat.js";
 import { createMentionLookup } from "./mention-source.js";
 import { createMentionResolver } from "./mentions.js";
-import { classify, conversationNameFrom, formatPush, isAtAll, normalizeEvent, pushIndexLine, splitText, wasDeliveredInLegacyHistory } from "./push.js";
+import { classify, conversationNameFrom, isAtAll, normalizeEvent, pushIndexLine, wasDeliveredInLegacyHistory } from "./push.js";
 import { appendVisible, rememberPush } from "./session.js";
 import { flushWrites, loadJson, saveJson } from "./store.js";
+import { emptyTopics, findByTopicId, topicFor } from "./topics.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sessionPath = resolve(root, "data/session.json");
@@ -17,6 +19,7 @@ const pushPath = resolve(root, "data/pushes.json");
 const seenPath = resolve(root, "data/seen.json");
 const outboxPath = resolve(root, "data/push-outbox.json");
 const mentionPath = resolve(root, "data/pending-mentions.json");
+const topicsPath = resolve(root, "data/topics.json");
 
 let config;
 let chat;
@@ -25,6 +28,8 @@ let pushes;
 let seen;
 let forwarder;
 let mentions;
+let topics;
+let delivery;
 let stopped = false;
 let connecting = false;
 let stream;
@@ -42,19 +47,28 @@ async function main() {
   seen = await loadJson(seenPath, {});
   const outbox = await loadJson(outboxPath, { pending: [], delivered: {} });
   const pendingMentions = await loadJson(mentionPath, { pending: [] });
+  topics = await loadJson(topicsPath, emptyTopics());
+  topics.byDingTalk ||= {};
   chat = new MagicChat({
     url: config.magicchat.ws_url,
     appId: config.magicchat.app_id,
     secret: config.magicchat.app_secret,
   });
+  delivery = createNotificationDelivery({
+    chat,
+    userId: config.magicchat.user_id,
+    topics,
+    saveTopics: (state) => saveJson(topicsPath, state),
+    resolveName: dingTalkTitle,
+  });
   forwarder = createPushForwarder({
     state: outbox,
     saveState: (state) => saveJson(outboxPath, state),
-    render: (event, reason) => splitText(formatPush(event, reason, event.conversation_name || names.get(event.conversation_id) || event.conversation_id || "")),
-    send: (content) => sendChunk(content),
+    render: delivery.render,
+    send: delivery.send,
     onDelivered: async (event, reason) => {
       console.log("[通知已送达] reason=" + reason + " message=" + event.message_id + " group=" + (event.conversation_id || ""));
-      pushes = rememberPush(pushes, pushIndexLine(event, reason, event.conversation_name || names.get(event.conversation_id) || ""));
+      pushes = rememberPush(pushes, pushIndexLine(event, reason, topicFor(topics, event.conversation_id)?.name || event.conversation_name || names.get(event.conversation_id) || ""));
       await saveJson(pushPath, pushes);
     },
     onLog: logIssue,
@@ -136,8 +150,12 @@ async function handleInbound(envelope) {
 async function handleUserMessage(payload) {
   const conversation = payload?.conversation;
   const sender = payload?.sender;
-  if (!conversation || conversation.type !== "app" || conversation.parent) return;
-  if (sender?.id !== config.magicchat.user_id) return;
+  if (!conversation || sender?.id !== config.magicchat.user_id) return;
+  if (conversation.type === "topic") {
+    await relayTopicReply(payload);
+    return;
+  }
+  if (conversation.type !== "app" || conversation.parent) return;
   const messageId = payload.message?.id;
   if (messageId && seen[messageId]) return;
   if (messageId) {
@@ -193,7 +211,8 @@ async function handleDingTalk(raw) {
 }
 
 function warmConversationName(groupId) {
-  if (!groupId || names.has(groupId) || nameRequests.has(groupId)) return;
+  if (!groupId || names.has(groupId)) return Promise.resolve();
+  if (nameRequests.has(groupId)) return nameRequests.get(groupId);
   const task = runDws(["chat", "+conversation-info", "--group", groupId], { timeoutMs: 8000 })
     .then((result) => {
       const name = conversationNameFrom(result.data);
@@ -202,17 +221,48 @@ function warmConversationName(groupId) {
     .catch((error) => console.error("查询群名失败：", error.message))
     .finally(() => nameRequests.delete(groupId));
   nameRequests.set(groupId, task);
+  return task;
 }
 
-async function sendChunk(content) {
-  await chat.request("message.send", {
-    target: { type: "user", user_id: config.magicchat.user_id },
-    message: { type: "markdown", content },
-  });
+async function dingTalkTitle(event, reason) {
+  if (reason === "dm") return cleanName(event.sender) || "私聊";
+  if (!event.conversation_name && !names.has(event.conversation_id)) await warmConversationName(event.conversation_id);
+  return cleanName(event.conversation_name || names.get(event.conversation_id)) || event.conversation_id || "群聊";
+}
+
+function cleanName(value) {
+  const text = String(value ?? "").trim();
+  return !text || text === "null" ? "" : text;
+}
+
+async function relayTopicReply(payload) {
+  const topicId = payload.conversation?.id;
+  const record = findByTopicId(topics, topicId);
+  if (!record) return;
+  const messageId = payload.message?.id;
+  if (messageId && seen[messageId]) return;
+  const text = String(payload.message?.body?.content || payload.message?.summary || "").trim();
+  if (!text) {
+    await delivery.sendToTopic(topicId, "这条消息没有可转发的文字。");
+    return;
+  }
+  try {
+    const target = record.kind === "dm"
+      ? ["--open-dingtalk-id", record.openDingTalkId, "--text", text]
+      : ["--group", record.dingTalkConversationId, "--text", text];
+    if (record.kind === "dm" && !record.openDingTalkId) throw new Error("没有对方的钉钉 ID");
+    await runDws(["chat", "+messages-send", "--as", "user", ...target, "--idempotency-key", String(messageId || topicId).slice(0, 32)]);
+    if (messageId) {
+      seen[messageId] = Date.now();
+      await saveJson(seenPath, seen);
+    }
+  } catch (error) {
+    await delivery.sendToTopic(topicId, "转发到钉钉失败：" + error.message);
+  }
 }
 
 async function sendText(text) {
-  for (const content of splitText(text)) await sendChunk(content);
+  return delivery.sendText(text);
 }
 
 function listen(delay) {

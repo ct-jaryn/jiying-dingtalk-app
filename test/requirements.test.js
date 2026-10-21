@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classify, isAtAll, mutedForConversation, pushIndexLine } from "../src/push.js";
+import { classify, conversationTitle, formatMainPush, formatTopicPush, isAtAll, mutedForConversation, pushIndexLine } from "../src/push.js";
 import { splitProtectedAndRounds, toAnthropicMessages, truncateOldToolResults, visibleHistory } from "../src/session.js";
+import { extractMediaIds, imageResourceIds, textWithoutImages } from "../src/media.js";
+import { creationText, findByTopicId, idsFromSend, rememberTopic, topicFor, topicIdFromCreate } from "../src/topics.js";
 import { toolKey } from "../src/tools.js";
 
 test("只推送私聊、@我和@所有人", () => {
@@ -10,6 +12,11 @@ test("只推送私聊、@我和@所有人", () => {
   assert.equal(classify({ type: "user_im_message_receive_group_all", content: "普通消息" }), null);
   assert.equal(classify({ type: "user_im_message_receive_group_all", content: "@所有人 发布" }), "at-all");
   assert.equal(isAtAll({ content: "请看 @all" }), true);
+});
+
+test("群名取 conversationInfo.title", () => {
+  const payload = { result: { conversationInfo: { title: "买菜群", openConversationId: "cidn7Xx3LJEGfbeCl3DuZUq3Q==" } } };
+  assert.equal(conversationTitle(payload), "买菜群");
 });
 
 test("按会话识别真实免打扰结果", () => {
@@ -24,6 +31,27 @@ test("按会话识别真实免打扰结果", () => {
   assert.equal(mutedForConversation(payload, "muted"), true);
   assert.equal(mutedForConversation(payload, "open"), false);
   assert.equal(mutedForConversation(payload, "missing"), null);
+});
+
+test("主对话和话题使用不同推送格式", () => {
+  const dm = { sender: "赵然", content: "在吗" };
+  const group = { sender: "陈佳", content: "今晚发布" };
+  assert.equal(formatMainPush(dm, "dm", "赵然"), "> 收到来自 **赵然** 的消息\n\n在吗");
+  assert.equal(formatMainPush(group, "mention", "销售群"), "> 收到来自 **陈佳** 在 **销售群** 的消息\n\n今晚发布");
+  assert.equal(formatTopicPush(dm, "dm"), "在吗");
+  assert.equal(formatTopicPush(group, "at-all"), "> **陈佳**：\n\n今晚发布");
+});
+
+test("从图片消息里取出 mediaId", () => {
+  const text = "[图片消息](mediaId=$iwEcAqNwbmcDAQTRCswF0QVW) 注意：如需下载使用dws chat message download-media命令下载";
+  assert.deepEqual(extractMediaIds(text), ["$iwEcAqNwbmcDAQTRCswF0QVW"]);
+  assert.equal(textWithoutImages(text), "");
+  assert.deepEqual(imageResourceIds({
+    messages: [{ resourceRefs: [
+      { resourceId: "$thumb", resourceIdType: "mediaId", type: "mediaId" },
+      { resourceId: "@image", resourceIdType: "mediaId", type: "mediaId", contentType: "image" },
+    ] }],
+  }), ["@image"]);
 });
 
 test("推送索引包含会话名", () => {
@@ -71,6 +99,17 @@ test("压缩时保留开头的可见历史和最新工具轮次", () => {
   assert.equal(split.prefix[0].content, "历史");
   assert.equal(split.rounds.length, 2);
   assert.equal(split.rounds.at(-1)[1].content[0].content, "新结果");
+});
+
+test("已有话题直接复用，没有话题才用创建对话消息", () => {
+  const store = { parentConversationId: "", byDingTalk: {} };
+  assert.equal(topicFor(store, "cid-1"), null);
+  assert.equal(creationText("销售群"), "销售群");
+  rememberTopic(store, "cid-1", { topicId: "topic-1", name: "销售群", kind: "group" });
+  assert.equal(topicFor(store, "cid-1").topicId, "topic-1");
+  assert.equal(findByTopicId(store, "topic-1").name, "销售群");
+  assert.equal(idsFromSend({ conversation: { id: "parent" }, message: { id: "msg" } }).messageId, "msg");
+  assert.equal(topicIdFromCreate({ conversation: { id: "topic-2" } }), "topic-2");
 });
 
 test("压缩时保留最新工具结果", () => {

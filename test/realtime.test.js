@@ -36,12 +36,17 @@ async function unusedPort() {
   return port;
 }
 
-async function fixture(t, { events, mentions = [], port = 0, initiallyOffline = false, failOnce = "" }) {
+async function fixture(t, { events = [], mentions = [], port = 0, initiallyOffline = false, failOnce = "" }) {
   const directory = await mkdtemp(join(tmpdir(), "jiying-realtime-test-"));
   const servers = [];
   const requests = [];
   const delivered = [];
+  const deliveries = [];
   const failed = new Set();
+  const sockets = new Set();
+  let nextMessage = 0;
+  let nextTopic = 0;
+  let nextEvent = 0;
   let child;
   let output = "";
   t.after(async () => {
@@ -91,6 +96,12 @@ if (args[0] === "event" && args[1] === "consume") {
   process.stdout.write(JSON.stringify({ items: JSON.parse(readFileSync(join(root, "mentions.json"), "utf8")), complete: true }));
 } else if (args[0] === "chat" && args[1] === "+conversation-info") {
   process.stdout.write(JSON.stringify({ conversationInfo: { title: "集成验证群" } }));
+} else if (args[0] === "chat" && args[1] === "+messages-mget") {
+  process.stdout.write(JSON.stringify({ messages: [{ resources: [{ contentType: "image", resourceIdType: "mediaId", resourceId: "fixture-image-resource" }] }] }));
+} else if (args[0] === "chat" && args[1] === "message" && args[2] === "download-media") {
+  process.stdout.write(JSON.stringify({ downloadUrl: "https://fixture.invalid/image.png" }));
+} else if (args[0] === "chat" && args[1] === "+messages-send") {
+  process.stdout.write(JSON.stringify({ success: true, result: { messageId: "fixture-relayed-message" } }));
 } else {
   process.stdout.write(JSON.stringify({ success: false, errorMsg: "不应调用的 fixture 命令: " + args.join(" ") }));
   process.exitCode = 9;
@@ -106,16 +117,30 @@ if (args[0] === "event" && args[1] === "consume") {
       server.once("error", reject);
     });
     server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
       socket.on("message", (raw) => {
         const envelope = JSON.parse(raw.toString());
         requests.push(envelope);
         const content = envelope.payload?.message?.content || "";
         const shouldFail = envelope.method === "message.send" && failOnce && content.includes(failOnce) && !failed.has(failOnce);
         if (shouldFail) failed.add(failOnce);
-        else if (envelope.method === "message.send") delivered.push(content);
+        else if (envelope.method === "message.send" && envelope.payload?.target?.type === "topic") {
+          delivered.push(content);
+          deliveries.push(envelope.payload);
+        }
+        let payload = {};
+        if (envelope.method === "message.send") {
+          payload = {
+            conversation: { id: envelope.payload.target.conversation_id || "fixture-parent" },
+            message: { id: `fixture-message-${++nextMessage}` },
+          };
+        } else if (envelope.method === "conversation.topic.create") {
+          payload = { conversation: { id: `fixture-topic-${++nextTopic}` } };
+        }
         socket.send(JSON.stringify({
           v: 1, kind: "response", reply_to: envelope.id, ok: !shouldFail,
-          ...(shouldFail ? { error: { code: "FIXTURE_TRANSIENT", message: "本地测试瞬时发送失败" } } : { payload: { message_id: "fixture-response" } }),
+          ...(shouldFail ? { error: { code: "FIXTURE_TRANSIENT", message: "本地测试瞬时发送失败" } } : { payload }),
         }));
       });
     });
@@ -139,8 +164,22 @@ if (args[0] === "event" && args[1] === "consume") {
   child.on("error", (error) => { output += `\n${error.stack}`; });
   const diagnostics = () => `child exit=${child.exitCode} signal=${child.signalCode}\n${output}`;
   return {
-    directory, delivered, requests, failed, diagnostics, startServer,
+    directory, delivered, deliveries, requests, failed, diagnostics, startServer,
     readOutbox: () => readJson(join(directory, "data", "push-outbox.json"), null),
+    async emitMessage({ topicId, text, senderId = "dummy-user", messageId = `fixture-inbound-${++nextEvent}` }) {
+      await waitFor(() => sockets.size > 0, "即应客户端连接", diagnostics);
+      const cursor = `fixture-cursor-${++nextEvent}`;
+      const envelope = {
+        v: 1, kind: "event", event: "message.created", cursor,
+        payload: {
+          conversation: { id: topicId, type: "topic", parent: { id: "fixture-parent", type: "app" } },
+          sender: { id: senderId },
+          message: { id: messageId, body: { type: "text", content: text } },
+        },
+      };
+      for (const socket of sockets) socket.send(JSON.stringify(envelope));
+      await waitFor(() => requests.some((item) => item.method === "events.ack" && item.payload?.cursor === cursor), "即应事件处理并确认", diagnostics);
+    },
     async calls() {
       try { return (await readFile(join(directory, "calls.jsonl"), "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse); }
       catch (error) { if (error.code === "ENOENT") return []; throw error; }
@@ -176,7 +215,8 @@ test("真实进程通过群事件补查 @，去重并向即应实时投递，发
     assert.equal(app.delivered.filter((text) => text.includes(marker)).length, 1, marker);
   }
   assert.equal(app.delivered.some((text) => text.includes("ORDINARY_DO_NOT_NOTIFY")), false);
-  assert.match(app.delivered.find((text) => text.includes("TARGET_FALLBACK")), /集成验证群/);
+  assert.ok(app.requests.some((item) => item.method === "message.send" && item.payload.target.type === "user" && item.payload.message.content === "集成验证群"), "用群名创建话题锚点");
+  assert.ok(app.deliveries.every((item) => item.target.type === "topic"), "实际通知进入话题");
   assert.equal(app.failed.size, 1);
   assert.equal(app.requests.filter((item) => item.method === "message.send" && item.payload.message.content.includes("DIRECT_MESSAGE_RETRY")).length, 2);
   const calls = await app.calls();
@@ -203,4 +243,48 @@ test("即应初始离线时真实进程先收取并持久化，连接恢复后�
     return app.delivered.length === 1 && outbox?.pending?.length === 0;
   }, "重连后发送已保留通知", app.diagnostics);
   assert.match(app.delivered[0], /OFFLINE_PENDING/);
+});
+
+test("图片失败后仅重试图片，同一钉钉会话复用即应话题", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [
+      group("image", "BODY_BEFORE_IMAGE\n[图片消息](mediaId=fixture-image-resource)", "user_im_message_receive_at"),
+      group("same-group", "SAME_TOPIC_SECOND_MESSAGE", "user_im_message_receive_at"),
+    ],
+    failOnce: "https://fixture.invalid/image.png",
+  });
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return app.deliveries.length === 3 && Object.keys(outbox?.delivered || {}).length === 2;
+  }, "正文与图片投递完成", app.diagnostics);
+
+  assert.equal(app.delivered.filter((text) => text.includes("BODY_BEFORE_IMAGE")).length, 1, "图片重试不重发已确认正文");
+  assert.equal(app.deliveries.filter((item) => item.message.type === "image").length, 1);
+  assert.equal(app.requests.filter((item) => item.method === "message.send" && item.payload.message.type === "image").length, 2);
+  assert.equal(app.requests.filter((item) => item.method === "conversation.topic.create").length, 1);
+  assert.equal(new Set(app.deliveries.map((item) => item.target.conversation_id)).size, 1);
+  assert.equal(app.requests.filter((item) => item.method === "message.send" && item.payload.target.type === "user").length, 1, "只发一个会话名锚点");
+  const calls = await app.calls();
+  assert.ok(calls.some((args) => args[1] === "+messages-mget" && args.includes("image")));
+  assert.equal(calls.filter((args) => args[1] === "message" && args[2] === "download-media").length, 2, "每次图片重试都重新取得下载地址");
+});
+
+test("仅 owner 的话题文字直接转发回绑定钉钉群，并防止重复转发", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [group("reply-source", "CREATE_REPLY_TOPIC", "user_im_message_receive_at")],
+  });
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return Object.keys(outbox?.delivered || {}).length === 1;
+  }, "话题创建并送达", app.diagnostics);
+  const topicId = app.deliveries[0].target.conversation_id;
+  await app.emitMessage({ topicId, text: "NON_OWNER_MUST_NOT_RELAY", senderId: "another-user", messageId: "foreign-reply" });
+  assert.equal((await app.calls()).filter((args) => args[1] === "+messages-send").length, 0);
+  await app.emitMessage({ topicId, text: "OWNER_REPLY_DIRECT", messageId: "owner-reply" });
+  await app.emitMessage({ topicId, text: "OWNER_REPLY_DIRECT", messageId: "owner-reply" });
+  const relays = (await app.calls()).filter((args) => args[0] === "chat" && args[1] === "+messages-send");
+  assert.equal(relays.length, 1);
+  assert.equal(relays[0][relays[0].indexOf("--as") + 1], "user");
+  assert.equal(relays[0][relays[0].indexOf("--group") + 1], "fixture-muted-group");
+  assert.equal(relays[0][relays[0].indexOf("--text") + 1], "OWNER_REPLY_DIRECT");
 });

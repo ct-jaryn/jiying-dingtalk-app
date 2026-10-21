@@ -91,11 +91,11 @@ export function createPushForwarder({
     if (!Array.isArray(item.parts)) {
       const rendered = await render(item.event, item.reason);
       const parts = typeof rendered === "string" ? [rendered] : rendered;
-      if (!Array.isArray(parts) || !parts.length || parts.some((part) => typeof part !== "string")) {
-        throw new TypeError("通知渲染结果必须是非空字符串数组");
+      if (!Array.isArray(parts) || !parts.length || parts.some((part) => typeof part !== "string" && (!part || typeof part !== "object" || Array.isArray(part)))) {
+        throw new TypeError("通知渲染结果必须是由文本或消息对象组成的非空数组");
       }
       await change((draft) => {
-        draft.pending.find((entry) => entry.key === key).parts = [...parts];
+        draft.pending.find((entry) => entry.key === key).parts = structuredClone(parts);
       });
       item = entryFor(key);
     }
