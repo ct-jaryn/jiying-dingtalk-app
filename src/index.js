@@ -4,24 +4,29 @@ import { runAgent } from "./agent.js";
 import { loadConfig } from "./config.js";
 import { runDws, startEventStream } from "./dws.js";
 import { MagicChat, startStatus } from "./magicchat.js";
-import { classify, formatPush, mutedForConversation, pushIndexLine } from "./push.js";
+import { downloadImageUrl, extractMediaIds, imageResourceIds, isImageContent, textWithoutImages } from "./media.js";
+import { classify, conversationTitle, formatTopicPush, messageBody, mutedForConversation, pushIndexLine } from "./push.js";
 import { appendVisible, rememberPush } from "./session.js";
 import { loadJson, saveJson } from "./store.js";
+import { creationText, emptyTopics, findByTopicId, idsFromSend, rememberTopic, topicFor, topicIdFromCreate } from "./topics.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sessionPath = resolve(root, "data/session.json");
 const pushPath = resolve(root, "data/pushes.json");
 const seenPath = resolve(root, "data/seen.json");
+const topicsPath = resolve(root, "data/topics.json");
 
 let config;
 let chat;
 let session;
 let pushes;
 let seen;
+let topics;
 let stopped = false;
 let connecting = false;
 let stream;
 const muteCache = new Map();
+const topicLocks = new Map();
 let inbound = Promise.resolve();
 
 async function main() {
@@ -29,6 +34,8 @@ async function main() {
   session = await loadJson(sessionPath, { summary: "", messages: [] });
   pushes = await loadJson(pushPath, []);
   seen = await loadJson(seenPath, {});
+  topics = await loadJson(topicsPath, emptyTopics());
+  topics.byDingTalk ||= {};
   chat = new MagicChat({
     url: config.magicchat.ws_url,
     appId: config.magicchat.app_id,
@@ -79,8 +86,12 @@ async function handleInbound(envelope) {
 async function handleUserMessage(payload) {
   const conversation = payload?.conversation;
   const sender = payload?.sender;
-  if (!conversation || conversation.type !== "app" || conversation.parent) return;
-  if (sender?.id !== config.magicchat.user_id) return;
+  if (!conversation || sender?.id !== config.magicchat.user_id) return;
+  if (conversation.type === "topic") {
+    await relayTopicReply(payload);
+    return;
+  }
+  if (conversation.type !== "app" || conversation.parent) return;
   const messageId = payload.message?.id;
   if (messageId && seen[messageId]) return;
   if (messageId) {
@@ -125,9 +136,16 @@ async function handleDingTalk(event) {
   if (reason !== "dm" && await isMuted(event.conversation_id)) return;
   seen[id] = Date.now();
   await saveJson(seenPath, seen);
-  const name = reason === "dm" ? "" : await conversationName(event.conversation_id);
-  const text = formatPush(event, reason, name);
-  await sendText(text);
+  const name = await dingTalkTitle(event, reason);
+  const images = await imageUrls(event);
+  if (images.length) {
+    const extra = textWithoutImages(messageBody(event));
+    const topicCaption = reason === "dm" ? "" : `> **${cleanName(event.sender) || "未知发送人"}**：`;
+    if (extra) await deliverToTopic(event, reason, name, reason === "dm" ? extra : `${topicCaption}\n\n${extra}`);
+    for (const url of images) await deliverImageToTopic(event, reason, name, url, extra ? "" : topicCaption);
+  } else {
+    await deliverToTopic(event, reason, name, formatTopicPush(event, reason));
+  }
   pushes = rememberPush(pushes, pushIndexLine(event, reason, name));
   await saveJson(pushPath, pushes);
 }
@@ -148,24 +166,181 @@ async function isMuted(conversationId) {
   }
 }
 
+async function dingTalkTitle(event, reason) {
+  if (reason === "dm") return cleanName(event.sender) || "私聊";
+  return cleanName(await conversationName(event.conversation_id)) || event.conversation_id || "群聊";
+}
+
+async function imageUrls(event) {
+  const raw = `${event.content || ""}\n${event.text || ""}`;
+  if (!isImageContent(raw)) return [];
+  let ids = [];
+  if (event.message_id) {
+    try {
+      const detail = await runDws(["chat", "+messages-mget", "--msg-ids", event.message_id, "--no-reactions", "--no-threads"]);
+      ids = imageResourceIds(detail.data);
+    } catch (error) {
+      console.error("读取图片资源失败：", error.message);
+    }
+  }
+  if (!ids.length) ids = extractMediaIds(raw);
+  const urls = [];
+  for (const mediaId of ids) {
+    try {
+      urls.push(await downloadImageUrl({
+        messageId: event.message_id,
+        conversationId: event.conversation_id,
+        mediaId,
+      }));
+    } catch (error) {
+      console.error("下载图片失败：", error.message);
+    }
+  }
+  return urls;
+}
+
+async function deliverImageToTopic(event, reason, name, url, caption) {
+  const dingTalkId = event.conversation_id;
+  if (!dingTalkId) return;
+  let record = topicFor(topics, dingTalkId);
+  if (!record?.topicId) record = await withTopicLock(dingTalkId, () => createTopic(dingTalkId, name, event, reason));
+  if (!record?.topicId) return;
+  await sendImage({ type: "topic", conversation_id: record.topicId }, url, caption);
+}
+
+async function sendImage(target, url, caption) {
+  const message = { type: "image", content: url };
+  if (caption) {
+    message.caption = caption;
+    message.caption_type = "markdown";
+  }
+  await chat.request("message.send", { target, message });
+}
+
+async function deliverToTopic(event, reason, name, text) {
+  const dingTalkId = event.conversation_id;
+  if (!dingTalkId) {
+    await sendText(text);
+    return;
+  }
+  let record = topicFor(topics, dingTalkId);
+  if (!record?.topicId) record = await withTopicLock(dingTalkId, () => createTopic(dingTalkId, name, event, reason));
+  if (!record?.topicId) {
+    await sendText(text);
+    return;
+  }
+  await sendToConversation(record.topicId, "topic", text);
+}
+
+async function createTopic(dingTalkId, name, event, reason) {
+  const existing = topicFor(topics, dingTalkId);
+  if (existing?.topicId) return existing;
+  const created = await sendText(creationText(name));
+  const ids = idsFromSend(created);
+  if (!ids.conversationId || !ids.messageId) {
+    console.error("创建话题失败：发送源头消息没有返回会话或消息 ID");
+    return null;
+  }
+  topics.parentConversationId = ids.conversationId;
+  const createdTopic = await chat.request("conversation.topic.create", {
+    conversation_id: ids.conversationId,
+    source_message_id: ids.messageId,
+  });
+  const topicId = topicIdFromCreate(createdTopic);
+  if (!topicId) {
+    console.error("创建话题失败：没有返回话题 ID");
+    return null;
+  }
+  const record = rememberTopic(topics, dingTalkId, {
+    topicId,
+    name,
+    kind: reason === "dm" ? "dm" : "group",
+    openDingTalkId: event.sender_open_dingtalk_id || "",
+    dingTalkConversationId: dingTalkId,
+  });
+  await saveJson(topicsPath, topics);
+  return record;
+}
+
+function withTopicLock(dingTalkId, fn) {
+  const previous = topicLocks.get(dingTalkId) || Promise.resolve();
+  const current = previous.then(fn, fn);
+  topicLocks.set(dingTalkId, current);
+  return current;
+}
+
+async function relayTopicReply(payload) {
+  const messageId = payload.message?.id;
+  if (messageId && seen[messageId]) return;
+  if (messageId) {
+    seen[messageId] = Date.now();
+    await saveJson(seenPath, seen);
+  }
+  const topicId = payload.conversation?.id;
+  const record = findByTopicId(topics, topicId);
+  if (!record) return;
+  const text = String(payload.message?.body?.content || payload.message?.summary || "").trim();
+  if (!text) {
+    await sendToConversation(topicId, "topic", "这条消息没有可转发的文字。");
+    return;
+  }
+  try {
+    await runDws(["chat", "+messages-send", "--as", "user", ...relayArgs(record, text), "--idempotency-key", String(payload.message?.id || topicId).slice(0, 32)]);
+  } catch (error) {
+    await sendToConversation(topicId, "topic", `转发到钉钉失败：${error.message}`);
+  }
+}
+
+function relayArgs(record, text) {
+  if (record.kind === "dm") {
+    if (!record.openDingTalkId) throw new Error("没有对方的钉钉 ID");
+    return ["--open-dingtalk-id", record.openDingTalkId, "--text", text];
+  }
+  return ["--group", record.dingTalkConversationId, "--text", text];
+}
+
+function cleanName(value) {
+  const text = String(value ?? "").trim();
+  return !text || text === "null" ? "" : text;
+}
+
 async function conversationName(conversationId) {
   if (!conversationId) return "";
   try {
-    const result = await runDws(["chat", "+conversation-info", "--group", conversationId], { timeoutMs: 12_000 });
-    return result.data?.name || result.data?.title || result.data?.conversation?.name || "";
-  } catch {
+    const result = await runDws(["chat", "+conversation-info", "--group", conversationId], { timeoutMs: 30_000 });
+    const title = conversationTitle(result.data);
+    if (!title) console.error("会话信息没有标题：", conversationId);
+    return title;
+  } catch (error) {
+    console.error("查询群名失败：", error.message);
     return "";
   }
 }
 
 async function sendText(text) {
-  const chunks = splitText(text, 3500);
-  for (const content of chunks) {
-    await chat.request("message.send", {
+  return sendToUser(text);
+}
+
+async function sendToUser(text) {
+  let last;
+  for (const content of splitText(text, 3500)) {
+    last = await chat.request("message.send", {
       target: { type: "user", user_id: config.magicchat.user_id },
       message: { type: "markdown", content },
     });
   }
+  return last;
+}
+
+async function sendToConversation(conversationId, type, text) {
+  let last;
+  for (const content of splitText(text, 3500)) {
+    last = await chat.request("message.send", {
+      target: { type, conversation_id: conversationId },
+      message: { type: "markdown", content },
+    });
+  }
+  return last;
 }
 
 function splitText(text, size) {

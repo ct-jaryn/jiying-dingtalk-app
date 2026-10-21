@@ -16,6 +16,13 @@ export function isAtAll(event) {
     || ["atAll", "at_all", "isAtAll", "is_at_all"].some((key) => event?.[key] === true);
 }
 
+export function conversationTitle(payload) {
+  const info = payload?.result?.conversationInfo || payload?.conversationInfo || payload?.result || payload || {};
+  return [info.title, info.name, info.conversationTitle, payload?.title, payload?.name]
+    .map((value) => String(value ?? "").trim())
+    .find((value) => value && value !== "null") || "";
+}
+
 export function mutedForConversation(payload, conversationId) {
   const settings = payload?.result?.settings || payload?.settings || [];
   const row = settings.find((item) => item.openConversationId === conversationId);
@@ -23,17 +30,27 @@ export function mutedForConversation(payload, conversationId) {
   return Number(row.notificationOff) === 1;
 }
 
-export function formatPush(event, reason, conversationName = "") {
+export function messageBody(event) {
+  return clean(event?.content || event?.text) || "（没有可显示的正文，可能是图片、文件或卡片）";
+}
+
+export function formatMainCaption(event, reason, conversationName = "") {
+  const name = conversationName || "未知会话";
+  if (reason === "dm") return `> 收到来自 **${name}** 的消息`;
   const sender = clean(event?.sender) || "未知发送人";
-  const where = conversationName ? `在 ${conversationName}` : "";
-  const body = clean(event?.content || event?.text) || "（没有可显示的正文，可能是图片、文件或卡片）";
-  return [
-    `**钉钉通知 · ${REASONS[reason] || "相关消息"}**`,
-    `**${sender}**${where ? ` ${where}` : ""}`,
-    formatTime(event?.create_time || event?.event_time || event?.timestamp),
-    "",
-    body,
-  ].filter((line, index) => line !== "" || index > 2).join("\n");
+  return `> 收到来自 **${sender}** 在 **${name}** 的消息`;
+}
+
+export function formatMainPush(event, reason, conversationName = "") {
+  const body = messageBody(event);
+  return `${formatMainCaption(event, reason, conversationName)}\n\n${body}`;
+}
+
+export function formatTopicPush(event, reason) {
+  const body = messageBody(event);
+  if (reason === "dm") return body;
+  const sender = clean(event?.sender) || "未知发送人";
+  return `> **${sender}**：\n\n${body}`;
 }
 
 export function pushIndexLine(event, reason, conversationName = "") {
