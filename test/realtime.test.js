@@ -36,7 +36,10 @@ async function unusedPort() {
   return port;
 }
 
-async function fixture(t, { events = [], mentions = [], port = 0, initiallyOffline = false, failOnce = "" }) {
+async function fixture(t, {
+  events = [], mentions = [], port = 0, initiallyOffline = false, failOnce = "", push,
+  groupSettings = { "fixture-muted-group": 1, "fixture-open-group": 0 },
+}) {
   const directory = await mkdtemp(join(tmpdir(), "jiying-realtime-test-"));
   const servers = [];
   const requests = [];
@@ -78,6 +81,7 @@ async function fixture(t, { events = [], mentions = [], port = 0, initiallyOffli
   await mkdir(join(directory, "bin"));
   await writeFile(join(directory, "events.json"), JSON.stringify(events));
   await writeFile(join(directory, "mentions.json"), JSON.stringify(mentions));
+  await writeFile(join(directory, "group-settings.json"), JSON.stringify(groupSettings));
   const fakeDws = join(directory, "bin", "dws");
   await writeFile(fakeDws, `#!${process.execPath}
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
@@ -96,12 +100,20 @@ if (args[0] === "event" && args[1] === "consume") {
   process.stdout.write(JSON.stringify({ items: JSON.parse(readFileSync(join(root, "mentions.json"), "utf8")), complete: true }));
 } else if (args[0] === "chat" && args[1] === "+conversation-info") {
   process.stdout.write(JSON.stringify({ conversationInfo: { title: "集成验证群" } }));
+} else if (args[0] === "chat" && args[1] === "group" && args[2] === "user-settings" && args[3] === "query") {
+  const groupId = args[args.indexOf("--groups") + 1];
+  const settings = JSON.parse(readFileSync(join(root, "group-settings.json"), "utf8"));
+  process.stdout.write(JSON.stringify({ result: { settings: [{ openConversationId: groupId, success: true, notificationOff: settings[groupId] ?? 1 }] } }));
 } else if (args[0] === "chat" && args[1] === "+messages-mget") {
   process.stdout.write(JSON.stringify({ messages: [{ resources: [{ contentType: "image", resourceIdType: "mediaId", resourceId: "fixture-image-resource" }] }] }));
 } else if (args[0] === "chat" && args[1] === "message" && args[2] === "download-media") {
   process.stdout.write(JSON.stringify({ downloadUrl: "https://fixture.invalid/image.png" }));
 } else if (args[0] === "chat" && args[1] === "+messages-send") {
-  process.stdout.write(JSON.stringify({ success: true, result: { messageId: "fixture-relayed-message" } }));
+  process.stdout.write(JSON.stringify({ success: true, result: { messageId: "msgFixtureRelayedMessage" } }));
+} else if (args[0] === "chat" && args[1] === "+messages-create-text-emotion") {
+  process.stdout.write(JSON.stringify({ success: true, result: { emotionId: "fixture-emotion-id" } }));
+} else if (args[0] === "chat" && args[1] === "+messages-add-text-emotion") {
+  process.stdout.write(JSON.stringify({ success: true }));
 } else {
   process.stdout.write(JSON.stringify({ success: false, errorMsg: "不应调用的 fixture 命令: " + args.join(" ") }));
   process.exitCode = 9;
@@ -151,6 +163,7 @@ if (args[0] === "event" && args[1] === "consume") {
   await writeFile(join(directory, "config.yaml"), JSON.stringify({
     anthropic: { base_url: "http://127.0.0.1:1", model: "dummy-model", api_key: "dummy-model-key" },
     magicchat: { ws_url: `ws://127.0.0.1:${selectedPort}`, app_id: "dummy-app", app_secret: "dummy-secret", user_id: "dummy-user" },
+    ...(push ? { push } : {}),
   }));
   child = spawn(process.execPath, ["src/index.js"], {
     cwd: directory,
@@ -187,12 +200,13 @@ if (args[0] === "event" && args[1] === "consume") {
   };
 }
 
-const group = (message_id, content, type = "user_im_message_receive_group_all") => ({
-  type, message_id, conversation_id: "fixture-muted-group", sender: "测试同事", content, timestamp: 1_792_539_000_000,
+const group = (message_id, content, type = "user_im_message_receive_group_all", conversation_id = "fixture-muted-group") => ({
+  type, message_id, conversation_id, sender: "测试同事", content, timestamp: 1_792_539_000_000,
 });
 
 test("真实进程通过群事件补查 @，去重并向即应实时投递，发送失败自动重试", { timeout: 15_000 }, async (t) => {
   const app = await fixture(t, {
+    push: { all_group_messages: false },
     events: [
       group("fallback", "TARGET_FALLBACK 请处理"),
       group("ordinary", "ORDINARY_DO_NOT_NOTIFY"),
@@ -223,6 +237,40 @@ test("真实进程通过群事件补查 @，去重并向即应实时投递，发
   assert.ok(calls.some((args) => args[0] === "event" && args[1] === "consume"));
   assert.ok(calls.some((args) => args[0] === "chat" && args[1] === "+at-me"));
   assert.equal(calls.some((args) => args.includes("user-settings")), false, "@通知不受群免打扰查询阻挡");
+});
+
+test("默认转发非免打扰群全量消息，免打扰群仍转发精确匹配的 @ 与原生 @", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [
+      group("open-ordinary", "OPEN_GROUP_ORDINARY", undefined, "fixture-open-group"),
+      group("open-ordinary", "OPEN_GROUP_ORDINARY", undefined, "fixture-open-group"),
+      group("muted-ordinary", "MUTED_ORDINARY_DO_NOT_NOTIFY"),
+      group("muted-fallback", "MUTED_FALLBACK_MENTION"),
+      group("muted-native", "MUTED_NATIVE_MENTION", "user_im_message_receive_at", "fixture-muted-native-only"),
+      group("muted-all", "@所有人 MUTED_AT_ALL", undefined, "fixture-muted-all-only"),
+    ],
+    mentions: [{ messageId: "muted-fallback", conversationId: "fixture-muted-group" }],
+    groupSettings: {
+      "fixture-open-group": 0,
+      "fixture-muted-group": 1,
+      "fixture-muted-native-only": 1,
+      "fixture-muted-all-only": 1,
+    },
+  });
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return app.delivered.length === 4 && Object.keys(outbox?.delivered || {}).length === 4;
+  }, "开放群普通消息与免打扰群的三类 @ 通知完成", app.diagnostics);
+  for (const marker of ["OPEN_GROUP_ORDINARY", "MUTED_FALLBACK_MENTION", "MUTED_NATIVE_MENTION", "MUTED_AT_ALL"]) {
+    assert.equal(app.delivered.filter((text) => text.includes(marker)).length, 1, marker);
+  }
+  assert.equal(app.delivered.some((text) => text.includes("MUTED_ORDINARY_DO_NOT_NOTIFY")), false);
+  const calls = await app.calls();
+  const settingsQueries = calls.filter((args) => args[1] === "group" && args[2] === "user-settings" && args[3] === "query");
+  assert.ok(settingsQueries.some((args) => args.includes("fixture-open-group")), "普通群消息按免打扰设置过滤");
+  assert.ok(settingsQueries.some((args) => args.includes("fixture-muted-group")), "免打扰群普通消息经过设置查询");
+  assert.equal(settingsQueries.some((args) => args.includes("fixture-muted-native-only") || args.includes("fixture-muted-all-only")), false, "原生 @ 与 @所有人直接通知");
+  assert.ok(calls.some((args) => args[1] === "+at-me" && args.includes("fixture-muted-group")), "免打扰群普通事件仍按消息 ID 补查 @");
 });
 
 test("即应初始离线时真实进程先收取并持久化，连接恢复后自动投递", { timeout: 15_000 }, async (t) => {
@@ -287,4 +335,9 @@ test("仅 owner 的话题文字直接转发回绑定钉钉群，并防止重复�
   assert.equal(relays[0][relays[0].indexOf("--as") + 1], "user");
   assert.equal(relays[0][relays[0].indexOf("--group") + 1], "fixture-muted-group");
   assert.equal(relays[0][relays[0].indexOf("--text") + 1], "OWNER_REPLY_DIRECT");
+  assert.ok(relays[0].includes("--ai-tag=false"));
+  assert.ok(relays[0].includes("--wait-delivery"));
+  const stamps = (await app.calls()).filter((args) => args[1] === "+messages-add-text-emotion");
+  assert.equal(stamps.length, 1, "成功回复只贴一次使用即应发送标记");
+  assert.equal(stamps[0][stamps[0].indexOf("--msg-id") + 1], "msgFixtureRelayedMessage");
 });

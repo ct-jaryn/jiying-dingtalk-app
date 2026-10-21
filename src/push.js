@@ -1,4 +1,4 @@
-const REASONS = { dm: "私聊", mention: "@我", "at-all": "@所有人" };
+const REASONS = { dm: "私聊", mention: "@我", "at-all": "@所有人", group: "群消息" };
 
 export function normalizeEvent(input) {
   let payload = input;
@@ -27,13 +27,16 @@ export function normalizeEvent(input) {
   };
 }
 
-export function classify(event) {
+export function classify(event, { allGroupMessages = true } = {}) {
   const type = String(event?.type || event?.event_type || "");
   if (type === "user_im_message_receive_o2o_all") return "dm";
   // This subscription is already scoped to the logged-in DingTalk user.
   if (type === "user_im_message_receive_at") return isAtAll(event) ? "at-all" : "mention";
-  if (type === "user_im_message_receive_group_all" && isAtAll(event)) return "at-all";
-  // Other group messages require an exact message-ID match from +at-me.
+  if (type === "user_im_message_receive_group_all") {
+    if (isAtAll(event)) return "at-all";
+    if (allGroupMessages) return "group";
+  }
+  // Mention-only mode requires an exact match from the personal @ index.
   return null;
 }
 

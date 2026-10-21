@@ -8,7 +8,8 @@ import { createPushForwarder } from "./forwarder.js";
 import { MagicChat, startStatus } from "./magicchat.js";
 import { createMentionLookup } from "./mention-source.js";
 import { createMentionResolver } from "./mentions.js";
-import { classify, conversationNameFrom, isAtAll, normalizeEvent, pushIndexLine, wasDeliveredInLegacyHistory } from "./push.js";
+import { classify, conversationNameFrom, isAtAll, mutedForConversation, normalizeEvent, pushIndexLine, wasDeliveredInLegacyHistory } from "./push.js";
+import { createTopicRelay } from "./relay.js";
 import { appendVisible, rememberPush } from "./session.js";
 import { flushWrites, loadJson, saveJson } from "./store.js";
 import { emptyTopics, findByTopicId, topicFor } from "./topics.js";
@@ -30,6 +31,7 @@ let forwarder;
 let mentions;
 let topics;
 let delivery;
+let relay;
 let stopped = false;
 let connecting = false;
 let stream;
@@ -37,6 +39,7 @@ let listenTimer;
 let restartDelay = 1000;
 const names = new Map();
 const nameRequests = new Map();
+const muteCache = new Map();
 const eventTasks = new Set();
 let inbound = Promise.resolve();
 
@@ -61,6 +64,7 @@ async function main() {
     saveTopics: (state) => saveJson(topicsPath, state),
     resolveName: dingTalkTitle,
   });
+  relay = createTopicRelay({ chat, root, emotionPath: resolve(root, "data/emotion.json") });
   forwarder = createPushForwarder({
     state: outbox,
     saveState: (state) => saveJson(outboxPath, state),
@@ -89,6 +93,14 @@ async function main() {
     state: pendingMentions,
     saveState: (state) => saveJson(mentionPath, state),
     fetchMentions,
+    forwardGroup: async (groupId, events) => {
+      if (config.push.all_group_messages === false) return false;
+      const muted = await isMuted(groupId);
+      if (muted == null) throw new Error("未能确认群免打扰设置，保留消息后重试");
+      if (muted) return false;
+      for (const event of events) await forwarder.enqueue(event, "group");
+      return true;
+    },
     onMention: async (event, match) => {
       const name = match.conversation?.name || match.conversation?.title || match.conversationName || "";
       if (name) names.set(event.conversation_id, name);
@@ -197,8 +209,8 @@ async function handleDingTalk(raw) {
   const id = event.message_id || event.event_id;
   if (!id || wasDeliveredInLegacyHistory(event, seen, pushes)) return;
   if (event.conversation_name) names.set(event.conversation_id, event.conversation_name);
-  const reason = classify(event);
-  if (reason) {
+  const reason = classify(event, { allGroupMessages: config.push.all_group_messages !== false });
+  if (reason && reason !== "group") {
     console.log("[通知已入队] reason=" + reason + " message=" + id);
     await forwarder.enqueue(event, reason);
     if (reason !== "dm") warmConversationName(event.conversation_id);
@@ -207,6 +219,21 @@ async function handleDingTalk(raw) {
   if (event.type === "user_im_message_receive_group_all") {
     console.log("[群消息已接收] message=" + id + " group=" + event.conversation_id);
     await mentions.enqueue(event);
+  }
+}
+
+async function isMuted(groupId) {
+  if (!groupId) return null;
+  const cached = muteCache.get(groupId);
+  if (cached && Date.now() - cached.at < 10 * 60_000) return cached.muted;
+  try {
+    const result = await runDws(["chat", "group", "user-settings", "query", "--groups", groupId], { timeoutMs: 10_000 });
+    const muted = mutedForConversation(result.data, groupId);
+    if (muted != null) muteCache.set(groupId, { muted, at: Date.now() });
+    return muted;
+  } catch (error) {
+    console.error("查询群免打扰失败：", error.message);
+    return null;
   }
 }
 
@@ -241,17 +268,8 @@ async function relayTopicReply(payload) {
   if (!record) return;
   const messageId = payload.message?.id;
   if (messageId && seen[messageId]) return;
-  const text = String(payload.message?.body?.content || payload.message?.summary || "").trim();
-  if (!text) {
-    await delivery.sendToTopic(topicId, "这条消息没有可转发的文字。");
-    return;
-  }
   try {
-    const target = record.kind === "dm"
-      ? ["--open-dingtalk-id", record.openDingTalkId, "--text", text]
-      : ["--group", record.dingTalkConversationId, "--text", text];
-    if (record.kind === "dm" && !record.openDingTalkId) throw new Error("没有对方的钉钉 ID");
-    await runDws(["chat", "+messages-send", "--as", "user", ...target, "--idempotency-key", String(messageId || topicId).slice(0, 32)]);
+    await relay(payload, record);
     if (messageId) {
       seen[messageId] = Date.now();
       await saveJson(seenPath, seen);
@@ -272,6 +290,7 @@ function listen(delay) {
       onReady: () => {
         restartDelay = 1000;
         console.log("钉钉实时监听已就绪：私聊、群聊@我、@所有人。");
+        console.log("群消息推送模式：" + (config.push.all_group_messages === false ? "仅提及" : "全部非免打扰群") + "；免打扰群被 @ 仍通知。");
       },
       onEvent: (event) => {
         const task = handleDingTalk(event).catch((error) => console.error("接收钉钉通知失败：", error.message));

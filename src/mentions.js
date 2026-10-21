@@ -7,6 +7,7 @@ export function createMentionResolver({
   state = { pending: [] },
   saveState,
   fetchMentions,
+  forwardGroup,
   onMention,
   onLog = () => {},
   debounceMs = 250,
@@ -164,6 +165,20 @@ export function createMentionResolver({
   async function processGroup(group) {
     const batch = state.pending.filter((item) => groupFor(item.event) === group);
     if (!batch.length || stopped) return;
+    let forwardError;
+    if (forwardGroup) {
+      try {
+        // The live event is already durable before consulting mute settings.
+        // Only remove it once the notification outbox has accepted the batch.
+        if (await forwardGroup(group, batch.map((item) => item.event))) {
+          for (const item of batch) await remove(item.key);
+          return;
+        }
+      } catch (error) {
+        forwardError = error;
+        log("群消息转发条件查询或入队失败，将保留重试", error);
+      }
+    }
     let result;
     let lookupError;
     if (batch.some((item) => !item.match)) {
@@ -178,10 +193,10 @@ export function createMentionResolver({
       try {
         if (record) {
           await deliver(item, record);
-        } else if (!lookupError && result?.complete && now() - Number(item.firstSeenAt) >= settleAfterMs) {
+        } else if (!forwardError && !lookupError && result?.complete && now() - Number(item.firstSeenAt) >= settleAfterMs) {
           await remove(item.key);
         } else {
-          await defer(item.key, !lookupError && result?.complete);
+          await defer(item.key, !forwardError && !lookupError && result?.complete);
         }
       } catch (error) {
         log("保存或转发群提及失败，将重试", error);

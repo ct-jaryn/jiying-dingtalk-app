@@ -2,15 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { classify, conversationTitle, formatMainPush, formatTopicPush, isAtAll, mutedForConversation, pushIndexLine } from "../src/push.js";
 import { splitProtectedAndRounds, toAnthropicMessages, truncateOldToolResults, visibleHistory } from "../src/session.js";
-import { extractMediaIds, imageResourceIds, textWithoutImages } from "../src/media.js";
+import { attachmentFromBody, extractMediaIds, imageResourceIds, textWithoutImages } from "../src/media.js";
 import { creationText, findByTopicId, idsFromSend, rememberTopic, topicFor, topicIdFromCreate } from "../src/topics.js";
+import { findEmotionId, sentMessageRef } from "../src/stamp.js";
 import { toolKey } from "../src/tools.js";
 
-test("只推送私聊、@我和@所有人", () => {
+test("默认推送所有群消息，关闭后只保留提及", () => {
   assert.equal(classify({ type: "user_im_message_receive_o2o_all" }), "dm");
   assert.equal(classify({ type: "user_im_message_receive_at" }), "mention");
-  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "普通消息" }), null);
-  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "@所有人 发布" }), "at-all");
+  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "普通消息" }), "group");
+  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "普通消息" }, { allGroupMessages: false }), null);
+  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "@所有人 发布" }, { allGroupMessages: false }), "at-all");
   assert.equal(isAtAll({ content: "请看 @all" }), true);
 });
 
@@ -40,6 +42,14 @@ test("主对话和话题使用不同推送格式", () => {
   assert.equal(formatMainPush(group, "mention", "销售群"), "> 收到来自 **陈佳** 在 **销售群** 的消息\n\n今晚发布");
   assert.equal(formatTopicPush(dm, "dm"), "在吗");
   assert.equal(formatTopicPush(group, "at-all"), "> **陈佳**：\n\n今晚发布");
+});
+
+test("话题图片消息能取出文件 ID", () => {
+  const attachment = attachmentFromBody({ type: "image", file_id: "file-1", caption: "看图" });
+  assert.equal(attachment.type, "image");
+  assert.deepEqual(attachment.fileIds, ["file-1"]);
+  assert.equal(attachment.caption, "看图");
+  assert.equal(attachmentFromBody({ type: "text", content: "你好" }), null);
 });
 
 test("从图片消息里取出 mediaId", () => {
@@ -80,6 +90,13 @@ test("每次只带最近 6 句可见历史和当前指令", () => {
   const messages = toAnthropicMessages(window, "现在处理");
   assert.equal(messages.at(-1).content, "现在处理");
   assert.equal(messages[0].role, "user");
+});
+
+test("发送回执能取出消息和会话 ID", () => {
+  const ref = sentMessageRef({ messageId: "msgABC==", openConversationId: "cidXYZ==" }, "cid-fallback");
+  assert.equal(ref.messageId, "msgABC==");
+  assert.equal(ref.conversationId, "cidXYZ==");
+  assert.equal(findEmotionId({ result: { emotionId: "emo-1" } }), "emo-1");
 });
 
 test("相同工具和参数只算一次", () => {

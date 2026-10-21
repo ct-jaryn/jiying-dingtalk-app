@@ -12,3 +12,7 @@ magicchat:
 agent:
   max_rounds: 25
   max_context_tokens: 100000
+
+push:
+  # true：推送所有未免打扰群的消息。false：只推送私聊、@你、@所有人。免打扰群被 @ 仍通知。
+  all_group_messages: true

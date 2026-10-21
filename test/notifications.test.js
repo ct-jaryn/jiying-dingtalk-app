@@ -8,7 +8,7 @@ import { flushWrites, saveJson } from "../src/store.js";
 
 test("原生群 @ 直接识别，群全量事件不能凭其他人的姓名猜测 @当前用户", () => {
   assert.equal(classify({ type: "user_im_message_receive_at", content: "请确认" }), "mention");
-  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "@其他同事 请确认" }), null);
+  assert.equal(classify({ type: "user_im_message_receive_group_all", content: "@其他同事 请确认" }, { allGroupMessages: false }), null);
   assert.equal(classify({ type: "user_im_message_receive_group_all", content: "@所有人 请确认" }), "at-all");
   assert.equal(isAtAll({ content: '示例 JSON: {"atAll":true}' }), false);
 });

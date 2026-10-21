@@ -39,6 +39,68 @@ async function until(predicate, timeoutMs = 500) {
   }
 }
 
+test("全量群转发先持久化事件，入队后移除且不再查询提及", async (t) => {
+  let lookups = 0;
+  const forwarded = [];
+  const app = fixture(t, {
+    forwardGroup: async (group, events) => {
+      assert.equal(group, "group-1");
+      assert.ok(app.snapshots.some((snapshot) => snapshot.pending.some((item) => item.event.message_id === "general")));
+      forwarded.push(...events.map((item) => item.message_id));
+      return true;
+    },
+    fetchMentions: async () => { lookups++; return complete(); },
+  });
+  await app.resolver.enqueue(event("general"));
+  await app.resolver.waitForIdle();
+  await app.resolver.enqueue(event("general"));
+  await app.resolver.waitForIdle();
+  assert.deepEqual(forwarded, ["general"]);
+  assert.equal(lookups, 0);
+  assert.equal(app.state.pending.length, 0);
+});
+
+test("群推送条件暂不可用时仍投递确认的@，普通事件保留并在恢复后继续", async (t) => {
+  let ready = false;
+  const forwarded = [];
+  const app = fixture(t, {
+    forwardGroup: async (_group, events) => {
+      if (!ready) throw new Error("免打扰状态暂不可用");
+      forwarded.push(...events.map((item) => item.message_id));
+      return true;
+    },
+    fetchMentions: async () => complete([record("mine")]),
+  });
+  await Promise.all([app.resolver.enqueue(event("mine")), app.resolver.enqueue(event("ordinary"))]);
+  await app.resolver.waitForIdle();
+  assert.deepEqual(app.mentions.map(({ item }) => item.message_id), ["mine"]);
+  assert.deepEqual(app.state.pending.map((item) => item.event.message_id), ["ordinary"]);
+  ready = true;
+  await app.resolver.wake();
+  await app.resolver.waitForIdle();
+  assert.deepEqual(forwarded, ["ordinary"]);
+  assert.equal(app.state.pending.length, 0);
+});
+
+test("全量群转发入队失败可从持久化事件重启恢复", async (t) => {
+  const first = fixture(t, {
+    forwardGroup: async () => { throw new Error("目标 outbox 暂不能保存"); },
+  });
+  await first.resolver.enqueue(event("recover"));
+  await first.resolver.waitForIdle();
+  assert.equal(first.state.pending.length, 1);
+  first.resolver.stop();
+  const forwarded = [];
+  const next = fixture(t, {
+    state: structuredClone(first.snapshots.at(-1)),
+    forwardGroup: async (_group, events) => { forwarded.push(...events.map((item) => item.message_id)); return true; },
+  });
+  await next.resolver.wake();
+  await next.resolver.waitForIdle();
+  assert.deepEqual(forwarded, ["recover"]);
+  assert.equal(next.state.pending.length, 0);
+});
+
 test("只按当前用户 @ 索引中的稳定消息 ID 匹配，不从正文猜测", async (t) => {
   const { resolver, mentions, state } = fixture(t, {
     fetchMentions: async () => complete([record("mine"), record("unrelated")]),
