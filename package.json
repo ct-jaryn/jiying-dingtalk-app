@@ -1,0 +1,18 @@
+{
+  "name": "jiying-dingtalk-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "即应里的个人钉钉聊天助手：推送相关消息，并在应用单聊里调用 dws",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "ws": "^8.18.3"
+  }
+}
