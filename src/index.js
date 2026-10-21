@@ -1,10 +1,11 @@
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAgent } from "./agent.js";
 import { loadConfig } from "./config.js";
 import { runDws, startEventStream } from "./dws.js";
 import { MagicChat, startStatus } from "./magicchat.js";
-import { downloadImageUrl, extractMediaIds, imageResourceIds, isImageContent, textWithoutImages } from "./media.js";
+import { attachmentFromBody, downloadImageUrl, extractMediaIds, imageResourceIds, isImageContent, textWithoutImages, urlsFromReadUrls } from "./media.js";
 import { classify, conversationTitle, formatTopicPush, messageBody, mutedForConversation, pushIndexLine } from "./push.js";
 import { appendVisible, rememberPush } from "./session.js";
 import { loadJson, saveJson } from "./store.js";
@@ -279,24 +280,84 @@ async function relayTopicReply(payload) {
   const topicId = payload.conversation?.id;
   const record = findByTopicId(topics, topicId);
   if (!record) return;
-  const text = String(payload.message?.body?.content || payload.message?.summary || "").trim();
+  const body = payload.message?.body || {};
+  const attachment = attachmentFromBody(body);
+  if (attachment) {
+    try {
+      await relayAttachment(payload, record, attachment);
+    } catch (error) {
+      console.error("转发图片失败：", error.message, JSON.stringify(body));
+      await sendToConversation(topicId, "topic", `转发到钉钉失败：${error.message}`);
+    }
+    return;
+  }
+  const text = String(body.content || payload.message?.summary || "").trim();
   if (!text) {
     await sendToConversation(topicId, "topic", "这条消息没有可转发的文字。");
     return;
   }
   try {
-    await runDws(["chat", "+messages-send", "--as", "user", ...relayArgs(record, text), "--idempotency-key", String(payload.message?.id || topicId).slice(0, 32)]);
+    await sendDingTalk(record, ["--text", text], payload.message?.id || topicId);
   } catch (error) {
     await sendToConversation(topicId, "topic", `转发到钉钉失败：${error.message}`);
   }
 }
 
-function relayArgs(record, text) {
+async function relayAttachment(payload, record, attachment) {
+  const urls = [...attachment.directUrl ? [attachment.directUrl] : [], ...await readAttachmentUrls(payload, attachment.fileIds)];
+  if (!urls.length) throw new Error("图片消息里没有可下载的文件");
+  const relativePath = await downloadToWorkspace(urls[0], payload.message?.id || "image");
+  const markdown = attachment.caption
+    ? `${attachment.caption}\n\n![图片](${relativePath})`
+    : `![图片](${relativePath})`;
+  await sendDingTalk(record, ["--markdown", markdown], payload.message?.id || record.topicId);
+}
+
+async function readAttachmentUrls(payload, fileIds) {
+  if (!fileIds.length) return [];
+  const result = await chat.request("temporary_files.read_urls", {
+    conversation_id: payload.conversation.id,
+    message_id: payload.message.id,
+    file_ids: fileIds,
+  });
+  return urlsFromReadUrls(result);
+}
+
+async function downloadToWorkspace(url, baseName) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`下载即应图片失败 HTTP ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const ext = extensionFrom(response.headers.get("content-type"), url);
+  const relativePath = `data/outbound/${String(baseName).replace(/[^A-Za-z0-9._-]/g, "_")}${ext}`;
+  await mkdir("data/outbound", { recursive: true });
+  await writeFile(relativePath, bytes);
+  return relativePath;
+}
+
+function extensionFrom(contentType, url) {
+  if (contentType?.includes("png")) return ".png";
+  if (contentType?.includes("jpeg") || contentType?.includes("jpg")) return ".jpg";
+  if (contentType?.includes("gif")) return ".gif";
+  if (contentType?.includes("webp")) return ".webp";
+  const match = String(url).match(/\.(png|jpe?g|gif|webp)(?:\?|$)/i);
+  return match ? `.${match[1].toLowerCase()}` : ".png";
+}
+
+async function sendDingTalk(record, contentArgs, idempotencyKey) {
+  await runDws([
+    "chat", "+messages-send", "--as", "user",
+    ...relayTargetArgs(record),
+    ...contentArgs,
+    "--idempotency-key", String(idempotencyKey).replace(/[^A-Za-z0-9]/g, "").slice(0, 32) || "relay",
+  ], { timeoutMs: 60_000 });
+}
+
+function relayTargetArgs(record) {
   if (record.kind === "dm") {
     if (!record.openDingTalkId) throw new Error("没有对方的钉钉 ID");
-    return ["--open-dingtalk-id", record.openDingTalkId, "--text", text];
+    return ["--open-dingtalk-id", record.openDingTalkId];
   }
-  return ["--group", record.dingTalkConversationId, "--text", text];
+  return ["--group", record.dingTalkConversationId];
 }
 
 function cleanName(value) {

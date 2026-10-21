@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { classify, conversationTitle, formatMainPush, formatTopicPush, isAtAll, mutedForConversation, pushIndexLine } from "../src/push.js";
 import { splitProtectedAndRounds, toAnthropicMessages, truncateOldToolResults, visibleHistory } from "../src/session.js";
-import { extractMediaIds, imageResourceIds, textWithoutImages } from "../src/media.js";
+import { attachmentFromBody, extractMediaIds, imageResourceIds, textWithoutImages } from "../src/media.js";
 import { creationText, findByTopicId, idsFromSend, rememberTopic, topicFor, topicIdFromCreate } from "../src/topics.js";
 import { toolKey } from "../src/tools.js";
 
@@ -40,6 +40,14 @@ test("主对话和话题使用不同推送格式", () => {
   assert.equal(formatMainPush(group, "mention", "销售群"), "> 收到来自 **陈佳** 在 **销售群** 的消息\n\n今晚发布");
   assert.equal(formatTopicPush(dm, "dm"), "在吗");
   assert.equal(formatTopicPush(group, "at-all"), "> **陈佳**：\n\n今晚发布");
+});
+
+test("话题图片消息能取出文件 ID", () => {
+  const attachment = attachmentFromBody({ type: "image", file_id: "file-1", caption: "看图" });
+  assert.equal(attachment.type, "image");
+  assert.deepEqual(attachment.fileIds, ["file-1"]);
+  assert.equal(attachment.caption, "看图");
+  assert.equal(attachmentFromBody({ type: "text", content: "你好" }), null);
 });
 
 test("从图片消息里取出 mediaId", () => {

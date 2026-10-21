@@ -3,6 +3,35 @@ import { runDws } from "./dws.js";
 
 const NOTICE = "注意：如需下载使用dws chat message download-media命令下载";
 
+export function attachmentFromBody(body) {
+  if (!body || !["image", "file"].includes(body.type)) return null;
+  const fileIds = [];
+  for (const value of [body.file_id, body.fileId, body.image?.file_id, body.image?.fileId]) {
+    if (value) fileIds.push(String(value));
+  }
+  for (const list of [body.file_ids, body.fileIds, body.files, body.attachments]) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (typeof item === "string") fileIds.push(item);
+      else if (item?.id) fileIds.push(String(item.id));
+      else if (item?.file_id) fileIds.push(String(item.file_id));
+    }
+  }
+  const directUrl = /^https?:\/\//.test(String(body.content || "")) ? String(body.content) : "";
+  return {
+    type: body.type,
+    fileIds: [...new Set(fileIds)],
+    directUrl,
+    caption: String(body.caption || "").trim(),
+  };
+}
+
+export function urlsFromReadUrls(payload) {
+  const found = [];
+  walkUrls(payload, found);
+  return [...new Set(found.filter((url) => /^https?:\/\//.test(url)))];
+}
+
 export function extractMediaIds(text) {
   const ids = [];
   const re = /mediaId=([^)\s]+)/g;
