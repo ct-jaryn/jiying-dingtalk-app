@@ -1,6 +1,38 @@
 import { spawn } from "node:child_process";
 
-export function runDws(args, { timeoutMs = 45_000, bin = "dws" } = {}) {
+const RETRIES = 5;
+
+export async function runDws(args, options = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= RETRIES; attempt += 1) {
+    try {
+      const result = await runDwsOnce(args, options);
+      if (result?.data?.error && isRetryable(JSON.stringify(result.data))) {
+        throw new Error(JSON.stringify(result.data.error));
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt === RETRIES || !isRetryable(error.message)) throw error;
+      const delay = 1000 * 2 ** attempt;
+      console.error(`dws 失败，${delay / 1000}s 后重试 ${attempt + 1}/${RETRIES}：${error.message}`);
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
+
+export function isRetryable(message) {
+  const text = String(message || "");
+  if (/"retryable"\s*:\s*false/.test(text)) return false;
+  return /retryable"\s*:\s*true|certificate|unknown authority|tls:|request_failed|timeout|ECONN|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket/i.test(text);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runDwsOnce(args, { timeoutMs = 45_000, bin = "dws" } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, [...args, "-f", "json", "-y", "--timeout", "30"], {
       stdio: ["ignore", "pipe", "pipe"],

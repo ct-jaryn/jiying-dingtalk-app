@@ -287,6 +287,7 @@ async function relayTopicReply(payload) {
   if (attachment) {
     try {
       await relayAttachment(payload, record, attachment);
+      await markTopicSent(payload);
     } catch (error) {
       console.error("转发图片失败：", error.message, JSON.stringify(body));
       await sendToConversation(topicId, "topic", `转发到钉钉失败：${error.message}`);
@@ -300,6 +301,7 @@ async function relayTopicReply(payload) {
   }
   try {
     await sendDingTalk(record, ["--text", text], payload.message?.id || topicId);
+    await markTopicSent(payload);
   } catch (error) {
     await sendToConversation(topicId, "topic", `转发到钉钉失败：${error.message}`);
   }
@@ -343,6 +345,18 @@ function extensionFrom(contentType, url) {
   if (contentType?.includes("webp")) return ".webp";
   const match = String(url).match(/\.(png|jpe?g|gif|webp)(?:\?|$)/i);
   return match ? `.${match[1].toLowerCase()}` : ".png";
+}
+
+async function markTopicSent(payload) {
+  const conversationId = payload.conversation?.id;
+  const messageId = payload.message?.id;
+  if (!conversationId || !messageId) return;
+  await chat.request("message.reaction.set", {
+    conversation_id: conversationId,
+    message_id: messageId,
+    text: "✌️",
+    reacted: true,
+  }).catch((error) => console.error("贴发送成功表情失败：", error.message));
 }
 
 async function sendDingTalk(record, contentArgs, idempotencyKey) {

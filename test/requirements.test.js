@@ -5,6 +5,7 @@ import { splitProtectedAndRounds, toAnthropicMessages, truncateOldToolResults, v
 import { attachmentFromBody, extractMediaIds, imageResourceIds, textWithoutImages } from "../src/media.js";
 import { creationText, findByTopicId, idsFromSend, rememberTopic, topicFor, topicIdFromCreate } from "../src/topics.js";
 import { findEmotionId, sentMessageRef } from "../src/stamp.js";
+import { isRetryable } from "../src/dws.js";
 import { toolKey } from "../src/tools.js";
 
 test("默认推送所有群消息，关闭后只保留提及", () => {
@@ -97,6 +98,11 @@ test("发送回执能取出消息和会话 ID", () => {
   assert.equal(ref.messageId, "msgABC==");
   assert.equal(ref.conversationId, "cidXYZ==");
   assert.equal(findEmotionId({ result: { emotionId: "emo-1" } }), "emo-1");
+});
+
+test("证书和网络错误会重试，明确不可重试的不重试", () => {
+  assert.equal(isRetryable("tls: failed to verify certificate: x509: certificate signed by unknown authority"), true);
+  assert.equal(isRetryable('{"retryable": false, "message": "参数错误"}'), false);
 });
 
 test("相同工具和参数只算一次", () => {
