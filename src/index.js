@@ -4,6 +4,7 @@ import { runAgent } from "./agent.js";
 import { loadConfig } from "./config.js";
 import { runDws, startEventStream } from "./dws.js";
 import { createNotificationDelivery } from "./delivery.js";
+import { createDmIdentityResolver } from "./dm-identity.js";
 import { createPushForwarder } from "./forwarder.js";
 import { MagicChat, startStatus } from "./magicchat.js";
 import { createMentionLookup } from "./mention-source.js";
@@ -66,12 +67,15 @@ async function main() {
     appId: config.magicchat.app_id,
     secret: config.magicchat.app_secret,
   });
+  const dmIdentity = createDmIdentityResolver({ topics });
   delivery = createNotificationDelivery({
     chat,
     userId: config.magicchat.user_id,
     topics,
     saveTopics: (state) => saveJson(topicsPath, state),
     resolveName: dingTalkTitle,
+    resolveDm: dmIdentity.resolve,
+    resolveDmRecord: dmIdentity.resolveRecord,
   });
   relay = createTopicRelay({ chat, root, emotionPath: resolve(root, "data/emotion.json"), outbound });
   forwarder = createPushForwarder({
@@ -150,6 +154,9 @@ async function connectForever() {
         await chat.connect();
         console.log("即应已连接。");
         forwarder.wake();
+        const repair = repairDmTopics();
+        eventTasks.add(repair);
+        repair.finally(() => eventTasks.delete(repair));
         return;
       } catch (error) {
         if (stopped) return;
@@ -270,7 +277,7 @@ function warmConversationName(groupId) {
 }
 
 async function dingTalkTitle(event, reason) {
-  if (reason === "dm") return cleanName(event.sender) || "私聊";
+  if (reason === "dm") return cleanName(event.dm_peer_name) || "私聊";
   if (!event.conversation_name && !names.has(event.conversation_id)) await warmConversationName(event.conversation_id);
   return cleanName(event.conversation_name || names.get(event.conversation_id)) || event.conversation_id || "群聊";
 }
@@ -282,11 +289,12 @@ function cleanName(value) {
 
 async function relayTopicReply(payload) {
   const topicId = payload.conversation?.id;
-  const record = findByTopicId(topics, topicId);
+  let record = findByTopicId(topics, topicId);
   if (!record) return;
   const messageId = payload.message?.id;
   if (messageId && seen[messageId]) return;
   try {
+    if (record.kind === "dm") record = await delivery.repairDm(record);
     await relay(payload, record);
     if (messageId) {
       seen[messageId] = Date.now();
@@ -295,6 +303,18 @@ async function relayTopicReply(payload) {
     await markTopicSent(payload);
   } catch (error) {
     await delivery.sendToTopic(topicId, "转发到钉钉失败：" + error.message);
+  }
+}
+
+async function repairDmTopics() {
+  for (const record of Object.values(topics.byDingTalk)) {
+    if (stopped) return;
+    if (record.kind !== "dm" || (record.identityVersion === 1 && !record.identityNoticePending)) continue;
+    try {
+      await delivery.repairDm(record);
+    } catch (error) {
+      logIssue("校验旧私聊话题失败，后续收到消息或回复时重试", error);
+    }
   }
 }
 

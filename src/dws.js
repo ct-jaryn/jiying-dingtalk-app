@@ -74,7 +74,7 @@ function retrySafeCommand(args) {
     }
   }
   // Unknown commands may mutate state; never replay them implicitly.
-  return domain === "contact" && action === "user" && resource === "search";
+  return domain === "contact" && action === "user" && ["search", "get-self"].includes(resource);
 }
 
 function sleep(ms) {

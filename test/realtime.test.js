@@ -10,6 +10,8 @@ import { WebSocketServer } from "ws";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pause = (ms) => new Promise((resolvePause) => setTimeout(resolvePause, ms));
+const dmPeer = { id: "fixture-open-peer", userId: "fixture-peer-user", name: "集成验证同事", cid: "fixture-dm-peer" };
+const dmSelf = { id: "fixture-open-owner", userId: "fixture-owner-user", name: "本人", cid: "fixture-dm-self" };
 
 async function waitFor(check, description, diagnostics = () => "", timeoutMs = 8000) {
   const until = Date.now() + timeoutMs;
@@ -91,6 +93,7 @@ import { appendFileSync, readFileSync, watchFile, writeFileSync } from "node:fs"
 import { join } from "node:path";
 const args = process.argv.slice(2);
 const root = process.env.REALTIME_FIXTURE_ROOT;
+const dmPeople = ${JSON.stringify([dmPeer, dmSelf])};
 appendFileSync(join(root, "calls.jsonl"), JSON.stringify(args) + "\\n");
 if (args[0] === "event" && args[1] === "consume") {
   writeFileSync(join(root, "event.pid"), String(process.pid));
@@ -108,7 +111,25 @@ if (args[0] === "event" && args[1] === "consume") {
 } else if (args[0] === "chat" && args[1] === "+at-me") {
   process.stdout.write(JSON.stringify({ items: JSON.parse(readFileSync(join(root, "mentions.json"), "utf8")), complete: true }));
 } else if (args[0] === "chat" && args[1] === "+conversation-info") {
-  process.stdout.write(JSON.stringify({ conversationInfo: { title: "集成验证群" } }));
+  const openId = args.includes("--open-dingtalk-id") ? args[args.indexOf("--open-dingtalk-id") + 1] : "";
+  const cid = args.includes("--group") ? args[args.indexOf("--group") + 1] : "";
+  const person = dmPeople.find((value) => openId ? value.id === openId : value.cid === cid);
+  if (openId && !person) {
+    process.stdout.write(JSON.stringify({ success: false, errorMsg: "未知的 fixture 私聊用户" }));
+    process.exitCode = 9;
+  } else {
+    process.stdout.write(JSON.stringify({ success: true, result: { conversationInfo: {
+      title: person?.name || "集成验证群", singleChat: Boolean(person), openConversationId: person?.cid || cid,
+    } } }));
+  }
+} else if (args[0] === "contact" && args[1] === "user" && args[2] === "get-self") {
+  process.stdout.write(JSON.stringify({ success: true, result: [{ isAdmin: false, orgEmployeeModel: { userId: dmPeople[1].userId } }] }));
+} else if (args[0] === "contact" && args[1] === "user" && args[2] === "search") {
+  const query = args[args.indexOf("--query") + 1];
+  const matches = dmPeople.filter((person) => person.name === query || person.userId === query);
+  process.stdout.write(JSON.stringify({ success: true, result: matches.map((person) => ({
+    name: person.name, userId: person.userId, openDingTalkId: person.id,
+  })) }));
 } else if (args[0] === "chat" && args[1] === "group" && args[2] === "user-settings" && args[3] === "query") {
   const groupId = args[args.indexOf("--groups") + 1];
   const settings = JSON.parse(readFileSync(join(root, "group-settings.json"), "utf8"));
@@ -238,6 +259,14 @@ const group = (message_id, content, type = "user_im_message_receive_group_all", 
   type, message_id, conversation_id, sender: "测试同事", content, timestamp: 1_792_539_000_000,
 });
 
+const dm = (message_id, content, { outgoing = false } = {}) => ({
+  type: "user_im_message_receive_o2o_all", message_id, content,
+  conversation_id: dmPeer.cid,
+  sender: outgoing ? dmSelf.name : dmPeer.name,
+  sender_open_dingtalk_id: outgoing ? dmSelf.id : dmPeer.id,
+  timestamp: 1_792_539_000_000,
+});
+
 test("真实进程通过群事件补查 @，去重并向即应实时投递，发送失败自动重试", { timeout: 15_000 }, async (t) => {
   const app = await fixture(t, {
     push: { all_group_messages: false },
@@ -247,7 +276,7 @@ test("真实进程通过群事件补查 @，去重并向即应实时投递，发
       group("native", "NATIVE_DUPLICATE", "user_im_message_receive_at"),
       group("native", "NATIVE_DUPLICATE"),
       group("all", "@所有人 ALL_BROADCAST"),
-      group("dm", "DIRECT_MESSAGE_RETRY", "user_im_message_receive_o2o_all"),
+      dm("dm", "DIRECT_MESSAGE_RETRY"),
     ],
     mentions: [
       { messageId: "fallback", conversationId: "fixture-muted-group", conversation: { name: "集成验证群" } },
@@ -277,6 +306,39 @@ test("真实进程通过群事件补查 @，去重并向即应实时投递，发
   assert.ok(calls.some((args) => args[0] === "event" && args[1] === "consume"));
   assert.ok(calls.some((args) => args[0] === "chat" && args[1] === "+at-me"));
   assert.equal(calls.some((args) => args.includes("user-settings")), false, "@通知不受群免打扰查询阻挡");
+});
+
+test("主动钉钉私聊按真实对端建话题，收发方向分明且回复只发送给对方", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [dm("dm-outgoing", "OUTGOING_TO_PEER", { outgoing: true })],
+  });
+  await waitFor(async () => Object.keys((await app.readOutbox())?.delivered || {}).length === 1, "主动私聊识别对方并投递", app.diagnostics);
+  const topics = await readJson(join(app.directory, "data", "topics.json"), null);
+  const record = topics.byDingTalk[dmPeer.cid];
+  assert.equal(record.name, dmPeer.name, "话题用实际对端名称，不能用当前账号名称");
+  assert.equal(record.openDingTalkId, dmPeer.id, "回复目标保存实际对端开放 ID");
+  assert.notEqual(record.openDingTalkId, dmSelf.id);
+  assert.equal(record.dingTalkConversationId, dmPeer.cid);
+  assert.equal(record.identityVersion, 1);
+  assert.equal(app.delivered[0], "**我**：OUTGOING_TO_PEER", "主动发出的消息明确标为我");
+  assert.ok(app.requests.some((item) => item.method === "message.send" && item.payload?.target?.type === "user" && item.payload?.message?.content === dmPeer.name), "使用对方名称创建话题锚点");
+
+  await app.emitDingTalk(dm("dm-incoming", "INCOMING_FROM_PEER"));
+  await waitFor(async () => Object.keys((await app.readOutbox())?.delivered || {}).length === 2, "同一私聊收到对方消息", app.diagnostics);
+  assert.equal(app.delivered[1], "INCOMING_FROM_PEER", "收到对方消息继续使用原正文");
+  assert.equal(app.deliveries.every((value) => value.target.conversation_id === record.topicId), true, "同一私聊收发都进入对方同一话题");
+  assert.equal(app.requests.filter((item) => item.method === "conversation.topic.create").length, 1);
+
+  await app.emitMessage({ topicId: record.topicId, text: "OWNER_DM_REPLY", messageId: "owner-dm-reply" });
+  await app.emitMessage({ topicId: record.topicId, text: "OWNER_DM_REPLY", messageId: "owner-dm-reply" });
+  const relays = (await app.calls()).filter((args) => args[0] === "chat" && args[1] === "+messages-send");
+  assert.equal(relays.length, 1, "同一即应回复不会重复发送");
+  assert.equal(relays[0][relays[0].indexOf("--open-dingtalk-id") + 1], dmPeer.id);
+  assert.equal(relays[0].includes(dmSelf.id), false, "不能把回复发送给本人");
+  assert.equal(relays[0].includes("--group"), false, "私聊不能使用群聊发送参数");
+  assert.equal(relays[0][relays[0].indexOf("--text") + 1], "OWNER_DM_REPLY");
+  assert.equal(app.requests.filter((item) => item.method === "message.reaction.set" && item.payload?.text === "✌️").length, 1);
+  assert.equal(app.deliveries.length, 2, "处理即应回复不会额外向话题复制正文");
 });
 
 test("默认转发非免打扰群全量消息，免打扰群仍转发精确匹配的 @ 与原生 @", { timeout: 15_000 }, async (t) => {
@@ -359,7 +421,7 @@ test("即应初始离线时真实进程先收取并持久化，连接恢复后�
   const port = await unusedPort();
   const app = await fixture(t, {
     port, initiallyOffline: true,
-    events: [group("offline-dm", "OFFLINE_PENDING", "user_im_message_receive_o2o_all")],
+    events: [dm("offline-dm", "OFFLINE_PENDING")],
   });
   await waitFor(async () => {
     const outbox = await app.readOutbox();

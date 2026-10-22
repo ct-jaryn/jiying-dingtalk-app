@@ -115,7 +115,7 @@ export function formatTopicSender(event) {
 
 export function formatTopicPush(event, reason) {
   const body = messageBody(event);
-  if (reason === "dm") return body;
+  if (reason === "dm") return event.dm_direction === "outgoing" ? `**我**：${body}` : body;
   return `${formatTopicSender(event)}${body}`;
 }
 
