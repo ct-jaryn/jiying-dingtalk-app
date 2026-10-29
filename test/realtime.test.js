@@ -41,6 +41,7 @@ async function unusedPort() {
 async function fixture(t, {
   events = [], mentions = [], port = 0, initiallyOffline = false, failOnce = "", push,
   echoDuringRelay = false, failStamp = false, failConfirmation = false, sendFails = false, relayDelayMs = 0,
+  mediaBehavior = {}, disconnectImageOnce = false,
   groupSettings = { "fixture-muted-group": 1, "fixture-open-group": 0 },
 }) {
   const directory = await mkdtemp(join(tmpdir(), "jiying-realtime-test-"));
@@ -56,6 +57,8 @@ async function fixture(t, {
   let child;
   let output = "";
   t.after(async () => {
+    // Release a deliberately stalled fixture download before stopping the app.
+    await writeFile(join(directory, "release-media"), "released").catch(() => {});
     if (child && child.exitCode === null && child.signalCode === null) {
       const closed = new Promise((resolveClose) => child.once("close", resolveClose));
       child.kill("SIGTERM");
@@ -75,7 +78,9 @@ async function fixture(t, {
       for (const client of server.clients) client.terminate();
       await new Promise((resolveClose) => server.close(() => resolveClose()));
     }
-    await rm(directory, { recursive: true, force: true });
+    // A short-lived fixture CLI can finish writing while teardown removes its
+    // directory, especially just after restarting the app.
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   await cp(join(project, "src"), join(directory, "src"), { recursive: true });
@@ -87,9 +92,10 @@ async function fixture(t, {
   await writeFile(join(directory, "mentions.json"), JSON.stringify(mentions));
   await writeFile(join(directory, "group-settings.json"), JSON.stringify(groupSettings));
   await writeFile(join(directory, "relay-behavior.json"), JSON.stringify({ echoDuringRelay, failStamp, sendFails, relayDelayMs }));
+  await writeFile(join(directory, "media-behavior.json"), JSON.stringify(mediaBehavior));
   const fakeDws = join(directory, "bin", "dws");
   await writeFile(fakeDws, `#!${process.execPath}
-import { appendFileSync, readFileSync, watchFile, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, watchFile, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const args = process.argv.slice(2);
 const root = process.env.REALTIME_FIXTURE_ROOT;
@@ -137,7 +143,14 @@ if (args[0] === "event" && args[1] === "consume") {
 } else if (args[0] === "chat" && args[1] === "+messages-mget") {
   process.stdout.write(JSON.stringify({ messages: [{ resources: [{ contentType: "image", resourceIdType: "mediaId", resourceId: "fixture-image-resource" }] }] }));
 } else if (args[0] === "chat" && args[1] === "message" && args[2] === "download-media") {
-  process.stdout.write(JSON.stringify({ downloadUrl: "https://fixture.invalid/image.png" }));
+  const behavior = JSON.parse(readFileSync(join(root, "media-behavior.json"), "utf8"));
+  while (behavior.gated && !existsSync(join(root, "release-media"))) await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+  if (behavior.errorCode) {
+    process.stdout.write(JSON.stringify({ success: false, error: { code: behavior.errorCode, message: "图片资源没有访问权限" } }));
+    process.exitCode = 9;
+  } else {
+    process.stdout.write(JSON.stringify({ downloadUrl: "https://fixture.invalid/image.png" }));
+  }
 } else if (args[0] === "chat" && args[1] === "+messages-send") {
   const behavior = JSON.parse(readFileSync(join(root, "relay-behavior.json"), "utf8"));
   if (behavior.relayDelayMs) await new Promise((resolveDelay) => setTimeout(resolveDelay, behavior.relayDelayMs));
@@ -182,6 +195,11 @@ if (args[0] === "event" && args[1] === "consume") {
       socket.on("message", (raw) => {
         const envelope = JSON.parse(raw.toString());
         requests.push(envelope);
+        if (disconnectImageOnce && envelope.method === "message.send" && envelope.payload?.message?.type === "image" && !failed.has("image-disconnect")) {
+          failed.add("image-disconnect");
+          socket.terminate();
+          return;
+        }
         const content = envelope.payload?.message?.content || "";
         const isConfirmation = envelope.method === "message.reaction.set" && envelope.payload?.text === "✌️";
         const shouldFailSend = envelope.method === "message.send" && failOnce && content.includes(failOnce) && !failed.has(failOnce);
@@ -215,20 +233,35 @@ if (args[0] === "event" && args[1] === "consume") {
     magicchat: { ws_url: `ws://127.0.0.1:${selectedPort}`, app_id: "dummy-app", app_secret: "dummy-secret", user_id: "dummy-user" },
     ...(push ? { push } : {}),
   }));
-  child = spawn(process.execPath, ["src/index.js"], {
-    cwd: directory,
-    env: { ...process.env, PATH: `${join(directory, "bin")}:${process.env.PATH || ""}`, REALTIME_FIXTURE_ROOT: directory },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (text) => { output += text; });
-  child.stderr.on("data", (text) => { output += text; });
-  child.on("error", (error) => { output += `\n${error.stack}`; });
+  function startChild() {
+    child = spawn(process.execPath, ["src/index.js"], {
+      cwd: directory,
+      env: { ...process.env, PATH: `${join(directory, "bin")}:${process.env.PATH || ""}`, REALTIME_FIXTURE_ROOT: directory },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (text) => { output += text; });
+    child.stderr.on("data", (text) => { output += text; });
+    child.on("error", (error) => { output += `\n${error.stack}`; });
+  }
+  startChild();
   const diagnostics = () => `child exit=${child.exitCode} signal=${child.signalCode}\n${output}`;
   return {
     directory, delivered, deliveries, requests, failed, diagnostics, startServer,
     readOutbox: () => readJson(join(directory, "data", "push-outbox.json"), null),
+    releaseMedia: () => writeFile(join(directory, "release-media"), "released"),
+    async restart() {
+      const closed = new Promise((resolveClose) => child.once("close", resolveClose));
+      child.kill("SIGTERM");
+      await closed;
+      const offset = output.length;
+      startChild();
+      await waitFor(() => {
+        const current = output.slice(offset);
+        return current.includes("即应已连接") && current.includes("钉钉实时监听已就绪");
+      }, "重启后恢复两端连接", diagnostics);
+    },
     async emitDingTalk(event) {
       await appendFile(join(directory, "injected-events.jsonl"), JSON.stringify(event) + "\n");
       const count = (await readFile(join(directory, "injected-events.jsonl"), "utf8")).trim().split("\n").filter(Boolean).length;
@@ -459,6 +492,64 @@ test("图片失败后仅重试图片，同一钉钉会话复用即应话题", { 
   const calls = await app.calls();
   assert.ok(calls.some((args) => args[1] === "+messages-mget" && args.includes("image")));
   assert.equal(calls.filter((args) => args[1] === "message" && args[2] === "download-media").length, 2, "每次图片重试都重新取得下载地址");
+});
+
+test("慢图片不阻塞其他会话，永久失败图片保留记录并在重启后停止重试", { timeout: 20_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [group("blocked-image", "SAVED_IMAGE_BODY\n[图片消息](mediaId=fixture-image-resource)", "user_im_message_receive_at", "fixture-image-group")],
+    mediaBehavior: { gated: true, errorCode: "NO_PERMISSION" },
+  });
+  const downloads = async () => (await app.calls()).filter((args) => args[1] === "message" && args[2] === "download-media");
+  await waitFor(async () => (await downloads()).length === 1, "进入受控慢图片下载", app.diagnostics);
+  assert.equal(app.delivered.filter((text) => text.includes("SAVED_IMAGE_BODY")).length, 1);
+
+  // The image CLI remains blocked until explicitly released. A different
+  // conversation must make progress without waiting for that download.
+  await app.emitDingTalk(group("while-image-blocked", "TEXT_WHILE_IMAGE_BLOCKED", "user_im_message_receive_at", "fixture-text-group"));
+  await waitFor(() => app.delivered.some((text) => text.includes("TEXT_WHILE_IMAGE_BLOCKED")), "慢图片未结束时转发另一会话文字", app.diagnostics);
+  assert.equal((await app.readOutbox())?.failed?.length || 0, 0, "慢下载本身不能被提前当作失败归档");
+  assert.equal(app.deliveries.some((item) => item.message.type === "image"), false);
+
+  await app.releaseMedia();
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return outbox?.pending?.length === 0 && outbox?.failed?.length === 1;
+  }, "永久失败图片已保存原始记录并发送说明", app.diagnostics);
+  const outbox = await app.readOutbox();
+  assert.equal(outbox.failed[0].event.message_id, "blocked-image");
+  assert.match(outbox.failed[0].event.content, /SAVED_IMAGE_BODY/);
+  assert.equal(outbox.failed[0].part.type, "image");
+  assert.equal(outbox.failed[0].part.mediaId, "fixture-image-resource");
+  assert.equal(app.delivered.filter((text) => text.includes("SAVED_IMAGE_BODY")).length, 1, "失败图片不能导致正文重复发送");
+  const notices = app.delivered.filter((text) => /图片/.test(text) && /钉钉/.test(text));
+  assert.equal(notices.length, 1, "图片失败只发送一次可理解的说明");
+  assert.doesNotMatch(notices[0], /fixture-image-resource|https?:\/\//, "说明不能展示资源 ID 或临时下载地址");
+  assert.equal((await downloads()).length, 1, "永久失败图片不反复下载");
+
+  await app.restart();
+  await app.emitDingTalk(group("after-image-restart", "TEXT_AFTER_IMAGE_RESTART", "user_im_message_receive_at", "fixture-text-group"));
+  await waitFor(() => app.delivered.some((text) => text.includes("TEXT_AFTER_IMAGE_RESTART")), "重启后继续转发新消息", app.diagnostics);
+  assert.equal((await app.readOutbox()).failed.length, 1, "重启保留失败图片记录");
+  assert.equal((await downloads()).length, 1, "重启不能再次下载已经归档的失败图片");
+  assert.equal(app.delivered.filter((text) => /图片/.test(text) && /钉钉/.test(text)).length, 1, "重启不重复说明或已确认正文");
+});
+
+test("图片发送遇到即应断线后继续投递，不能误归档为图片永久失败", { timeout: 15_000 }, async (t) => {
+  const app = await fixture(t, {
+    events: [group("image-disconnect", "BODY_BEFORE_DISCONNECT\n[图片消息](mediaId=fixture-image-resource)", "user_im_message_receive_at")],
+    disconnectImageOnce: true,
+  });
+  await waitFor(() => app.failed.has("image-disconnect"), "图片发送中模拟即应断线", app.diagnostics);
+  await waitFor(async () => {
+    const outbox = await app.readOutbox();
+    return outbox?.pending?.length === 0 && Object.keys(outbox?.delivered || {}).length === 1;
+  }, "连接恢复后完成原图片投递", app.diagnostics);
+  const outbox = await app.readOutbox();
+  assert.equal(outbox.failed?.length || 0, 0, "即应连接故障不能当成媒体永久失败");
+  assert.equal(app.delivered.filter((text) => text.includes("BODY_BEFORE_DISCONNECT")).length, 1);
+  assert.equal(app.deliveries.filter((item) => item.message.type === "image").length, 1);
+  assert.equal(app.requests.filter((item) => item.method === "message.send" && item.payload?.message?.type === "image").length, 2, "断线后只续传未确认的图片");
+  assert.equal(app.delivered.some((text) => /图片/.test(text) && /钉钉/.test(text)), false, "短暂连接故障不需要发送失败占位说明");
 });
 
 test("仅 owner 的话题文字直接转发回绑定钉钉群，并防止重复转发", { timeout: 15_000 }, async (t) => {

@@ -52,7 +52,7 @@ async function main() {
   session = await loadJson(sessionPath, { summary: "", messages: [] });
   pushes = await loadJson(pushPath, []);
   seen = await loadJson(seenPath, {});
-  const outbox = await loadJson(outboxPath, { pending: [], delivered: {} });
+  const outbox = await loadJson(outboxPath, { pending: [], delivered: {}, failed: [] });
   const pendingMentions = await loadJson(mentionPath, { pending: [] });
   const outboundState = await loadJson(outboundPath, { sent: {} });
   outbound = createOutboundGuard({
@@ -83,11 +83,13 @@ async function main() {
     saveState: (state) => saveJson(outboxPath, state),
     render: delivery.render,
     send: delivery.send,
+    onFailurePart: delivery.failurePart,
     shouldSkip: (event) => outbound.isSent(event),
     onSkipped: logSuppressedEcho,
-    onDelivered: async (event, reason) => {
-      console.log("[通知已送达] reason=" + reason + " message=" + event.message_id + " group=" + (event.conversation_id || ""));
-      pushes = rememberPush(pushes, pushIndexLine(event, reason, topicFor(topics, event.conversation_id)?.name || event.conversation_name || names.get(event.conversation_id) || ""));
+    onDelivered: async (event, reason, { partial = false, failedParts = 0 } = {}) => {
+      console.log((partial ? "[通知部分送达]" : "[通知已送达]") + " reason=" + reason + " message=" + event.message_id + " group=" + (event.conversation_id || "") + (partial ? " failedImages=" + failedParts : ""));
+      const line = pushIndexLine(event, reason, topicFor(topics, event.conversation_id)?.name || event.conversation_name || names.get(event.conversation_id) || "");
+      pushes = rememberPush(pushes, line + (partial ? `（${failedParts} 个图片分块未能转发，失败说明已送达）` : ""));
       await saveJson(pushPath, pushes);
     },
     onLog: logIssue,
@@ -153,7 +155,7 @@ async function connectForever() {
       try {
         await chat.connect();
         console.log("即应已连接。");
-        forwarder.wake();
+        forwarder.wake({ force: false });
         const repair = repairDmTopics();
         eventTasks.add(repair);
         repair.finally(() => eventTasks.delete(repair));

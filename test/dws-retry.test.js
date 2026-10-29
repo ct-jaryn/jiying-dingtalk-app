@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,8 +33,24 @@ async function timedFixture(t, source) {
   t.after(() => rm(directory, { recursive: true, force: true }));
   const calls = join(directory, "calls");
   const bin = join(directory, "dws.sh");
-  await writeFile(bin, `#!/bin/sh\ncalls='${calls.replaceAll("'", "'\\''")}'\n${source}\n`);
+  await writeFile(bin, `#!/bin/sh
+if [ "\${1-}" = "--fixture-warmup" ]; then
+  printf 'fixture-ready\\n'
+  exit 0
+fi
+calls='${calls.replaceAll("'", "'\\''")}'
+${source}
+`);
   await chmod(bin, 0o755);
+  // macOS can inspect a newly executable script on first launch. Wait for this
+  // exact fixture to be ready before measuring runDws's strict time budget.
+  const ready = await new Promise((resolve, reject) => {
+    execFile(bin, ["--fixture-warmup"], { timeout: 10_000 }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+  assert.equal(ready, "fixture-ready\n");
   return { bin, count: async () => (await readFile(calls, "utf8")).trim().split("\n").length };
 }
 

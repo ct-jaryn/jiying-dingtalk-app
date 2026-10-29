@@ -1,10 +1,11 @@
 import { runDws } from "./dws.js";
-import { downloadImageUrl, extractMediaIds, imageResourceIds, isImageContent, textWithoutImages } from "./media.js";
+import { downloadImageUrl, extractMediaIds, imageResourceIds, isImageContent, MEDIA_REQUEST_TIMEOUT_MS, textWithoutImages } from "./media.js";
+import { createMediaError, imageSendError, mediaError, mediaFailureReason } from "./media-errors.js";
 import { formatTopicPush, formatTopicSender, messageBody, splitText } from "./push.js";
 import { creationText, idsFromSend, topicFor, topicIdFromCreate } from "./topics.js";
 
 /** Route durable notification parts into one topic per DingTalk conversation. */
-export function createNotificationDelivery({ chat, userId, topics, saveTopics, resolveName, resolveDm = async (event) => event, resolveDmRecord }) {
+export function createNotificationDelivery({ chat, userId, topics, saveTopics, resolveName, resolveDm = async (event) => event, resolveDmRecord, query = runDws, downloadImage = downloadImageUrl }) {
   const locks = new Map();
   let storage = Promise.resolve();
   const userTarget = { type: "user", user_id: userId };
@@ -115,19 +116,27 @@ export function createNotificationDelivery({ chat, userId, topics, saveTopics, r
     const body = messageBody(event);
     if (!isImageContent(`${event.content || ""}\n${event.text || ""}`)) return splitText(formatTopicPush(event, reason));
     let ids = [];
+    let lookupError;
     if (event.message_id) {
       try {
-        const detail = await runDws(["chat", "+messages-mget", "--msg-ids", event.message_id, "--no-reactions", "--no-threads"]);
+        const detail = await query(["chat", "+messages-mget", "--msg-ids", event.message_id, "--no-reactions", "--no-threads"], { timeoutMs: MEDIA_REQUEST_TIMEOUT_MS, retries: 0 });
         ids = imageResourceIds(detail.data);
       } catch (error) {
-        console.error("读取图片资源失败，将尝试消息中的资源 ID：", error.message);
+        lookupError = mediaError(error);
       }
     }
     if (!ids.length) ids = extractMediaIds(body);
-    if (!ids.length) throw new Error("图片消息缺少可用的资源 ID，将重试读取");
+    // A temporary metadata failure must be re-read on retry. Do not persist that
+    // temporary error as an immutable image part that can never recover.
+    if (!ids.length && lookupError && !lookupError.permanent) throw lookupError;
     const text = textWithoutImages(body);
     const caption = reason === "dm" ? (event.dm_direction === "outgoing" ? "**我**：" : "") : formatTopicSender(event);
     const parts = text ? splitText(`${caption}${text}`) : [];
+    if (!ids.length) {
+      const failure = lookupError || createMediaError("MEDIA_RESOURCE_MISSING");
+      parts.push({ type: "image", mediaId: "", caption: text ? "" : caption, failureCode: failure.code });
+      return parts;
+    }
     // Persist the resource reference, since a downloaded URL can expire while
     // offline. Each send attempt obtains a fresh URL and records its progress.
     for (const mediaId of ids) parts.push({ type: "image", mediaId, caption: text ? "" : caption });
@@ -140,15 +149,30 @@ export function createNotificationDelivery({ chat, userId, topics, saveTopics, r
     if (typeof part === "string") {
       return chat.request("message.send", { target, message: { type: "markdown", content: part } });
     }
-    if (part?.type !== "image" || !part.mediaId) throw new Error("无法发送的通知分块");
-    const url = await downloadImageUrl({ messageId: event.message_id, conversationId: event.conversation_id, mediaId: part.mediaId });
+    if (part?.type !== "image") throw new Error("无法发送的通知分块");
+    if (part.failureCode) throw createMediaError(part.failureCode);
+    if (!part.mediaId) throw createMediaError("MEDIA_RESOURCE_MISSING");
+    let url;
+    try {
+      url = await downloadImage({ messageId: event.message_id, conversationId: event.conversation_id, mediaId: part.mediaId });
+    } catch (error) {
+      throw mediaError(error);
+    }
     const message = { type: "image", content: url };
     if (part.caption) {
       message.caption = part.caption;
       message.caption_type = "markdown";
     }
-    return chat.request("message.send", { target, message });
+    try {
+      return await chat.request("message.send", { target, message });
+    } catch (error) {
+      throw imageSendError(error);
+    }
   }
 
-  return { render, send, sendText, repairDm, sendToTopic: (topicId, text) => sendText(text, { type: "topic", conversation_id: topicId }) };
+  function failurePart(part, { error }) {
+    return `${part?.caption || ""}[图片暂无法转发：${mediaFailureReason(error)}，请到钉钉查看原消息]`;
+  }
+
+  return { render, send, sendText, repairDm, failurePart, sendToTopic: (topicId, text) => sendText(text, { type: "topic", conversation_id: topicId }) };
 }
