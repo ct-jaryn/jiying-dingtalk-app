@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { runDws } from "./dws.js";
 import { stampSentMessage } from "./stamp.js";
 import { resolve } from "node:path";
@@ -29,7 +29,7 @@ export const TOOLS = [
   },
   {
     name: "read_messages",
-    description: "读取一个钉钉会话的最近消息。群聊传 conversation_id，单聊传 open_dingtalk_id。",
+    description: "读取一个钉钉会话的最近消息。群聊传 conversation_id，单聊传 open_dingtalk_id；两个目标必须且只能选一个。",
     input_schema: {
       type: "object",
       properties: {
@@ -50,7 +50,7 @@ export const TOOLS = [
   },
   {
     name: "send_message",
-    description: "以当前用户身份发送钉钉私聊或群消息。调用后会直接发出，不要先向用户确认。",
+    description: "以当前用户身份发送钉钉私聊或群消息。conversation_id、group_name、open_dingtalk_id、user_id、user_name 五个目标必须且只能选一个。调用后会直接发出，不要先向用户确认。",
     input_schema: {
       type: "object",
       properties: {
@@ -83,7 +83,7 @@ export function toolKey(name, input) {
   return `${name}:${createHash("sha256").update(JSON.stringify(sortKeys(input || {}))).digest("hex")}`;
 }
 
-export async function executeTool(name, input, { outbound } = {}) {
+export async function executeTool(name, input, { outbound, requestScope } = {}) {
   switch (name) {
     case "list_unread":
       return runDws(["chat", "message", "list-unread-conversations", "--count", String(input.count || 30)]);
@@ -98,12 +98,19 @@ export async function executeTool(name, input, { outbound } = {}) {
         ? runDws(["chat", "+chat-search", "--query", input.query])
         : runDws(["contact", "user", "search", "--query", input.query]);
     case "send_message":
-      return sendAndStamp(["chat", "+messages-send", "--as", "user", "--ai-tag=false", "--wait-delivery", ...sendArgs(input), "--idempotency-key", toolKey(name, input).slice(0, 32)], input.conversation_id, outbound);
+      return sendAndStamp(["chat", "+messages-send", "--as", "user", "--ai-tag=false", "--wait-delivery", ...sendArgs(input), "--idempotency-key", sendKey(name, input, requestScope)], input.conversation_id, outbound);
     case "reply_message":
-      return sendAndStamp(["chat", "+messages-reply", "--as", "user", "--ai-tag=false", "--wait-delivery", "--message-id", input.message_id, "--content", input.text, ...(input.conversation_id ? ["--group", input.conversation_id] : []), "--idempotency-key", toolKey(name, input).slice(0, 32)], input.conversation_id, outbound);
+      return sendAndStamp(["chat", "+messages-reply", "--as", "user", "--ai-tag=false", "--wait-delivery", "--message-id", input.message_id, "--content", input.text, ...(input.conversation_id ? ["--group", input.conversation_id] : []), "--idempotency-key", sendKey(name, input, requestScope)], input.conversation_id, outbound);
     default:
       throw new Error(`未知工具 ${name}`);
   }
+}
+
+function sendKey(name, input, requestScope) {
+  // Identical content in a later user request is a new send. Only retries of
+  // the same request and operation should share a remote idempotency key.
+  const scope = String(requestScope || randomUUID());
+  return createHash("sha256").update(JSON.stringify([scope, toolKey(name, input)])).digest("hex").slice(0, 32);
 }
 
 async function sendAndStamp(args, conversationId, outbound) {
@@ -127,20 +134,28 @@ function searchArgs(input) {
 }
 
 function readArgs(input) {
-  const args = ["--limit", String(input.limit || 20)];
-  if (input.conversation_id) return ["--group", input.conversation_id, ...args];
-  if (input.open_dingtalk_id) return ["--open-dingtalk-id", input.open_dingtalk_id, ...args];
-  throw new Error("读取会话需要 conversation_id 或 open_dingtalk_id");
+  return [...targetArgs(input, {
+    conversation_id: "--group", open_dingtalk_id: "--open-dingtalk-id",
+  }, "读取会话"), "--limit", String(input.limit || 20)];
 }
 
 function sendArgs(input) {
-  const args = ["--text", input.text];
-  if (input.conversation_id) return ["--group", input.conversation_id, ...args];
-  if (input.group_name) return ["--chat-query", input.group_name, ...args];
-  if (input.open_dingtalk_id) return ["--open-dingtalk-id", input.open_dingtalk_id, ...args];
-  if (input.user_id) return ["--user", input.user_id, ...args];
-  if (input.user_name) return ["--user-query", input.user_name, ...args];
-  throw new Error("发送消息需要群或人的目标");
+  return [...targetArgs(input, {
+    conversation_id: "--group", group_name: "--chat-query", open_dingtalk_id: "--open-dingtalk-id",
+    user_id: "--user", user_name: "--user-query",
+  }, "发送消息"), "--text", input.text];
+}
+
+function targetArgs(input, flags, action) {
+  const targets = [];
+  for (const [field, flag] of Object.entries(flags)) {
+    const value = input[field];
+    if (value == null) continue;
+    if (typeof value !== "string") throw new Error(`${action}的目标 ${field} 必须是非空字符串`);
+    if (value.trim()) targets.push([field, flag, value.trim()]);
+  }
+  if (targets.length !== 1) throw new Error(`${action}必须且只能指定一个目标，请重新选择 ${Object.keys(flags).join("、")} 中的一项`);
+  return targets[0].slice(1);
 }
 
 function sortKeys(value) {

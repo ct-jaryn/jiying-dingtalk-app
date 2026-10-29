@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { HISTORY_LIMIT, estimateTokens, splitProtectedAndRounds, toAnthropicMessages, truncateOldToolResults, visibleHistory } from "./session.js";
 import { TOOLS, executeTool, toolKey } from "./tools.js";
 
@@ -11,7 +12,7 @@ const STATUS = {
   reply_message: "正在回复消息",
 };
 
-export async function runAgent({ config, session, pushIndex, instruction, status, complete, outbound }) {
+export async function runAgent({ config, session, pushIndex, instruction, status, complete, outbound, requestId = randomUUID() }) {
   await compressSession(config, session, pushIndex);
   const messages = toAnthropicMessages(visibleHistory(session.messages), instruction);
   const seen = new Set();
@@ -34,7 +35,7 @@ export async function runAgent({ config, session, pushIndex, instruction, status
       else {
         seen.add(key);
         try {
-          const result = await executeTool(tool.name, tool.input || {}, { outbound });
+          const result = await executeTool(tool.name, tool.input || {}, { outbound, requestScope: requestId });
           output = clip(JSON.stringify(result.data ?? result));
         } catch (error) {
           output = `工具失败：${error.message}`;
@@ -93,27 +94,48 @@ async function compact(config, messages, summary, pushIndex) {
   ];
 }
 
-async function callModel(config, messages, summary, pushIndex, withTools) {
+export async function callModel(config, messages, summary, pushIndex, withTools) {
   const base = config.anthropic.base_url.replace(/\/$/, "");
   const url = base.endsWith("/v1") ? `${base}/messages` : `${base}/v1/messages`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": config.anthropic.api_key,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: config.anthropic.model,
-      max_tokens: 4096,
-      system: systemPrompt(summary, pushIndex),
-      messages,
-      ...(withTools ? { tools: TOOLS } : {}),
-    }),
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error?.message || `模型请求失败 HTTP ${response.status}`);
-  return body;
+  const timeoutMs = Math.min(180_000, Math.max(1, Number(config.anthropic.request_timeout_ms) || 90_000));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": config.anthropic.api_key,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: config.anthropic.model,
+        max_tokens: 4096,
+        system: systemPrompt(summary, pushIndex),
+        messages,
+        ...(withTools ? { tools: TOOLS } : {}),
+      }),
+    });
+    let body;
+    try {
+      body = await response.json();
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw new Error(response.ok ? "模型返回了无效的 JSON 响应" : `模型请求失败 HTTP ${response.status}`);
+    }
+    if (controller.signal.aborted) throw new Error("模型请求已超时");
+    if (!response.ok) throw new Error(body?.error?.message || `模型请求失败 HTTP ${response.status}`);
+    if (!Array.isArray(body?.content)) throw new Error("模型响应缺少有效的 content 数组");
+    return body;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw Object.assign(new Error("模型请求超时，请稍后重试"), { code: "MODEL_TIMEOUT" });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function systemPrompt(summary, pushIndex) {

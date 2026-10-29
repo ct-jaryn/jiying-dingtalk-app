@@ -32,6 +32,7 @@ export async function loadConfig(path) {
   };
   config.agent.max_rounds = Number(config.agent.max_rounds) || 25;
   config.agent.max_context_tokens = Number(config.agent.max_context_tokens) || 100_000;
+  config.anthropic.request_timeout_ms = Math.min(180_000, Math.max(1000, Number(config.anthropic.request_timeout_ms) || 90_000));
   config.push = {
     all_group_messages: true,
     muted_conversations: false,

@@ -60,7 +60,7 @@ export function createMentionLookup({ queryPage, now = Date.now, maxPagesPerRun 
     const days = Math.min(3650, requiredDays);
     let scan = scans.get(group);
     if (!scan || scan.days !== days || scan.finished) {
-      scan = { days, cursor: null, visited: new Set(), covered: new Set(wanted), matches: new Map(), finished: false };
+      scan = { days, cursor: null, visited: new Set(), covered: new Set(wanted), matches: new Map(), finished: false, resumeDue: false };
       scans.set(group, scan);
     }
     for (const id of scan.matches.keys()) if (!wanted.has(id)) scan.matches.delete(id);
@@ -87,8 +87,12 @@ export function createMentionLookup({ queryPage, now = Date.now, maxPagesPerRun 
       partial ||= !complete;
     }
 
+    // Usually refresh the home page first, so new mentions need not wait for a
+    // deep scan. With a one-page budget, alternate that refresh with a saved
+    // continuation; otherwise the continuation could never run at all.
+    const resumeFirst = maxPagesPerRun === 1 && scan.resumeDue && scan.cursor != null;
     for (let request = 0; request < maxPagesPerRun; request += 1) {
-      const home = request === 0;
+      const home = request === 0 && !resumeFirst;
       const cursor = home ? "0" : scan.cursor;
       if (!home && scan.visited.has(cursor)) {
         failures.push({ code: "CURSOR_CYCLE", message: "@消息查询返回了重复分页游标" });
@@ -97,6 +101,9 @@ export function createMentionLookup({ queryPage, now = Date.now, maxPagesPerRun 
         break;
       }
       let page;
+      // A one-page budget still needs home refreshes when a continuation is
+      // failing, while retaining that cursor for the following attempt.
+      if (!home && maxPagesPerRun === 1) scan.resumeDue = false;
       try { page = inspectPage(await queryPage({ groupId: group, days, cursor })); }
       catch (error) {
         failures.push(failure(error));
@@ -111,6 +118,7 @@ export function createMentionLookup({ queryPage, now = Date.now, maxPagesPerRun 
         partial = true;
         break;
       }
+      if (!home) scan.resumeDue = false;
       if (page.terminal) {
         // A refreshed first page that now contains the whole index covers new
         // pending IDs too. Final cursors are intentionally ignored.
@@ -132,8 +140,12 @@ export function createMentionLookup({ queryPage, now = Date.now, maxPagesPerRun 
         scan.finished = true;
         break;
       }
-      if (added) {
-        // Deliver confirmed mentions immediately; remaining IDs resume later.
+      if (home && maxPagesPerRun === 1) scan.resumeDue = true;
+      if (added && !(home && scan.resumeDue && maxPagesPerRun > 1)) {
+        // Yield immediately on the first fresh home-page match, but a second
+        // consecutive match must also advance the saved continuation. Busy
+        // groups must not keep older mentions trapped behind page zero.
+        if (home) scan.resumeDue = true;
         partial = true;
         break;
       }

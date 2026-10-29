@@ -211,6 +211,7 @@ async function handleUserMessage(payload) {
       session,
       pushIndex: pushes,
       instruction: String(instruction),
+      requestId: messageId,
       status,
       outbound,
     });
